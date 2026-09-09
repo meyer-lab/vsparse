@@ -28,13 +28,18 @@ class _VCSNormalizedBase(NormalizedViewBase):
 
     __slots__ = ("_dual_arr",)
 
+    _dual_arr: _VCSBase | None
+
     def __init__(
         self, arr: _VCSBase, recipe: str | Recipe = DEFAULT_RECIPE, *, stale: bool = False
     ) -> None:
         super().__init__(arr, recipe, stale=stale)
+        self._init_extra()
+
+    def _init_extra(self) -> None:
         # Opposite-format copy of `arr`, cached by vsparse._vcs_matmul when
         # regrouping the whole array fits one chunk's budget.
-        self._dual_arr: _VCSBase | None = None
+        self._dual_arr = None
 
     def __matmul__(self, other: Any) -> Any:
         """``self @ other`` for a dense ``other`` -- see :mod:`vsparse._vcs_matmul`."""

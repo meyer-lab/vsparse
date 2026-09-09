@@ -446,10 +446,16 @@ class NormalizedViewBase:
         self.gene_scale = np.where(b > 0.0, 1.0 / b, 0.0)
         self.col_mean = np.asarray(c, dtype=np.float64)
         self.col_post_scale = np.asarray(s, dtype=np.float64)
-        # Subclasses with the ``_dual_arr`` slot (VCS views) need it initialized
-        # too, since ``__init__`` (which normally does) is bypassed here.
-        self._dual_arr = None
+        self._init_extra()
         return self
+
+    def _init_extra(self) -> None:
+        """Hook for subclasses with extra per-instance state (e.g. ``_dual_arr``).
+
+        ``__init__`` normally initializes that state itself; :meth:`from_stats`
+        builds an instance via ``object.__new__`` instead, bypassing it, so it
+        calls this explicitly. A no-op here; overridden where needed.
+        """
 
     # -- recipe-facing statistics (a/b/c/s, as named in the issue) -------------
 
