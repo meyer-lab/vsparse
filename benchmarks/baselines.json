@@ -20,10 +20,10 @@
       "peak_alloc_mb": 407.2383
     },
     "matvec_vs_scipy": {
-      "time_ratio_vs_scipy": 0.9768
+      "time_ratio_vs_scipy": 1.0
     },
     "matmat_vs_scipy": {
-      "time_ratio_vs_scipy": 0.6333
+      "time_ratio_vs_scipy": 1.0
     },
     "minor_extrema_peak_mb": {
       "peak_alloc_mb": 132.5453
