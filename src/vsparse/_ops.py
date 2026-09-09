@@ -167,8 +167,6 @@ def minor_counts(value_ptr, indices, n_minor, nthreads):
     return partial.sum(axis=0)
 
 
-
-
 def major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor):
     return _major_matvec(major_ptr, values, value_ptr, indices, np.asarray(x), n_major, n_minor)
 
@@ -223,7 +221,9 @@ def minor_select_counts(value_ptr, indices, fanout):
     return counts
 
 
-def minor_select_fill(value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices):
+def minor_select_fill(
+    value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
+):
     """Write the remapped minor indices for the surviving slots, in place."""
     _minor_select_fill(
         value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices

@@ -21,6 +21,7 @@ from vsparse import _construct, _ops
 from vsparse._indexutils import is_full_slice as _is_full_slice
 from vsparse._indexutils import normalize_major_idx as _normalize_major_idx
 from vsparse._indexutils import smallest_index_dtype as _smallest_index_dtype
+from vsparse._norm_common import DEFAULT_RECIPE as _DEFAULT_RECIPE
 
 __all__ = ["VCSCArray", "VCSRArray"]
 
@@ -39,7 +40,7 @@ class _VCSBase:
     # __rmatmul__/__rmul__ instead of trying to broadcast us as an ndarray.
     __array_ufunc__ = None
 
-    __slots__ = ("indices", "major_ptr", "shape", "value_ptr", "values")
+    __slots__ = ("_norm_cache", "indices", "major_ptr", "shape", "value_ptr", "values")
 
     def __init__(
         self,
@@ -56,9 +57,7 @@ class _VCSBase:
         indices = np.asarray(indices)
 
         if major_ptr.shape[0] != n_major + 1:
-            raise ValueError(
-                f"major_ptr has length {major_ptr.shape[0]}, expected {n_major + 1}"
-            )
+            raise ValueError(f"major_ptr has length {major_ptr.shape[0]}, expected {n_major + 1}")
         if value_ptr.shape[0] != values.shape[0] + 1:
             raise ValueError("value_ptr must have length len(values) + 1")
         if major_ptr[-1] != values.shape[0]:
@@ -79,6 +78,7 @@ class _VCSBase:
         self.values = values
         self.value_ptr = value_ptr
         self.indices = indices
+        self._norm_cache: dict[str, Any] = {}
 
     # -- axis bookkeeping ------------------------------------------------
 
@@ -112,8 +112,7 @@ class _VCSBase:
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         cls = type(self).__name__
         return (
-            f"<{cls} shape={self.shape} dtype={self.dtype} "
-            f"nnz={self.nnz} n_unique={self.n_unique}>"
+            f"<{cls} shape={self.shape} dtype={self.dtype} nnz={self.nnz} n_unique={self.n_unique}>"
         )
 
     def copy(self):
@@ -200,12 +199,38 @@ class _VCSBase:
         )
         return other_cls(self.shape, major_ptr, values, value_ptr, indices)
 
-    def normalized(self) -> Any:
-        """A read-depth-normalized, log-transformed, mean-centered *view* -- see :mod:`vsparse._vcs_norm`."""
+    def normalized(self, view: str = _DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
+        """A normalized *view* of this array -- see :mod:`vsparse._vcs_norm`/:mod:`vsparse._norm_common`.
+
+        Parameters
+        ----------
+        view
+            Which normalization recipe to apply -- one of
+            :data:`vsparse._norm_common.RECIPES` (``"raw"``, ``"cp10k_log1p"``,
+            ``"parafac2"`` (the default), ``"scanpy"``, ``"pearson"``).
+        recalculate
+            If ``True`` (the default), (re)compute the recipe's statistics
+            fresh from this array. If ``False``, reuse a previously computed
+            view for ``view`` on this same array, if one exists (from an
+            earlier ``.normalized(view, ...)`` call, with any value of
+            ``recalculate``) -- this is how switching between recipes avoids
+            recomputing each one every time. If no such view has been
+            computed yet, one is still computed (there is nothing to reuse).
+        """
+        from vsparse._norm_common import resolve_recipe
         from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
+        recipe = resolve_recipe(view)
+        cache = self._norm_cache
+        if not recalculate:
+            cached = cache.get(recipe.name)
+            if cached is not None:
+                return cached
+
         cls = VCSCArrayNormalized if self._format == "csc" else VCSRArrayNormalized
-        return cls(self)
+        result = cls(self, recipe)
+        cache[recipe.name] = result
+        return result
 
     def log1p(self) -> _VCSBase:
         """Elementwise ``log1p``. Structural zeros stay zero implicitly."""
@@ -229,7 +254,10 @@ class _VCSBase:
     def _minor_sums(self) -> np.ndarray:
         """A parallel scatter-add over every nonzero to get per-minor-index totals."""
         return _ops.minor_sums(
-            self.values, self.value_ptr, self.indices, self.n_minor,
+            self.values,
+            self.value_ptr,
+            self.indices,
+            self.n_minor,
             _ops.accumulator_threads(self.n_minor),
         )
 
@@ -255,7 +283,9 @@ class _VCSBase:
     def _minor_nnz(self) -> np.ndarray:
         """A parallel scatter over every nonzero to get per-minor-index counts."""
         return _ops.minor_counts(
-            self.value_ptr, self.indices, self.n_minor,
+            self.value_ptr,
+            self.indices,
+            self.n_minor,
             _ops.accumulator_threads(self.n_minor),
         )
 
@@ -355,9 +385,7 @@ class _VCSBase:
         if np.isscalar(other):
             if other == 0:
                 return self.copy()
-            raise NotImplementedError(
-                "adding a nonzero scalar to a sparse array is not supported"
-            )
+            raise NotImplementedError("adding a nonzero scalar to a sparse array is not supported")
         return self._elementwise(other, "__add__")
 
     __radd__ = __add__
@@ -465,15 +493,11 @@ class _VCSBase:
         other_arr = np.asarray(other)
         if other_arr.ndim == 1:
             if other_arr.shape[0] != self.shape[1]:
-                raise ValueError(
-                    f"shapes {self.shape} and {other_arr.shape} not aligned"
-                )
+                raise ValueError(f"shapes {self.shape} and {other_arr.shape} not aligned")
             return self._dot_right(other_arr)
         if other_arr.ndim == 2:
             if other_arr.shape[0] != self.shape[1]:
-                raise ValueError(
-                    f"shapes {self.shape} and {other_arr.shape} not aligned"
-                )
+                raise ValueError(f"shapes {self.shape} and {other_arr.shape} not aligned")
             return self._dot_right_mat(other_arr)
         return NotImplemented
 
@@ -481,15 +505,11 @@ class _VCSBase:
         other_arr = np.asarray(other)
         if other_arr.ndim == 1:
             if other_arr.shape[0] != self.shape[0]:
-                raise ValueError(
-                    f"shapes {other_arr.shape} and {self.shape} not aligned"
-                )
+                raise ValueError(f"shapes {other_arr.shape} and {self.shape} not aligned")
             return self._dot_left(other_arr)
         if other_arr.ndim == 2:
             if other_arr.shape[1] != self.shape[0]:
-                raise ValueError(
-                    f"shapes {other_arr.shape} and {self.shape} not aligned"
-                )
+                raise ValueError(f"shapes {other_arr.shape} and {self.shape} not aligned")
             return self._dot_left_mat(other_arr)
         return NotImplemented
 
@@ -503,9 +523,11 @@ class _VCSBase:
         new_major_ptr = np.zeros(idx.shape[0] + 1, dtype=np.int64)
         np.cumsum(counts, out=new_major_ptr[1:])
 
-        value_slots = np.concatenate(
-            [np.arange(s, e) for s, e in zip(starts, ends, strict=True)]
-        ) if idx.shape[0] else np.empty(0, dtype=np.int64)
+        value_slots = (
+            np.concatenate([np.arange(s, e) for s, e in zip(starts, ends, strict=True)])
+            if idx.shape[0]
+            else np.empty(0, dtype=np.int64)
+        )
         new_values = self.values[value_slots]
 
         v_starts = self.value_ptr[value_slots]
@@ -513,14 +535,14 @@ class _VCSBase:
         idx_counts = v_ends - v_starts
         new_value_ptr = np.zeros(value_slots.shape[0] + 1, dtype=np.int64)
         np.cumsum(idx_counts, out=new_value_ptr[1:])
-        new_indices = np.concatenate(
-            [self.indices[s:e] for s, e in zip(v_starts, v_ends, strict=True)]
-        ) if value_slots.shape[0] else np.empty(0, dtype=self.indices.dtype)
+        new_indices = (
+            np.concatenate([self.indices[s:e] for s, e in zip(v_starts, v_ends, strict=True)])
+            if value_slots.shape[0]
+            else np.empty(0, dtype=self.indices.dtype)
+        )
 
         n_minor = self.n_minor
-        new_shape = (
-            (n_minor, idx.shape[0]) if self._format == "csc" else (idx.shape[0], n_minor)
-        )
+        new_shape = (n_minor, idx.shape[0]) if self._format == "csc" else (idx.shape[0], n_minor)
         return type(self)(new_shape, new_major_ptr, new_values, new_value_ptr, new_indices)
 
     def _major_range(self, start: int, stop: int) -> _VCSBase:
@@ -532,9 +554,7 @@ class _VCSBase:
         u0, u1 = int(self.major_ptr[start]), int(self.major_ptr[stop])
         k0, k1 = int(self.value_ptr[u0]), int(self.value_ptr[u1])
         n_sel = stop - start
-        new_shape = (
-            (self.n_minor, n_sel) if self._format == "csc" else (n_sel, self.n_minor)
-        )
+        new_shape = (self.n_minor, n_sel) if self._format == "csc" else (n_sel, self.n_minor)
         return type(self)(
             new_shape,
             self.major_ptr[start : stop + 1] - u0,
@@ -569,8 +589,13 @@ class _VCSBase:
         # Keep the parent's index dtype, as every other structural op does.
         new_indices = np.empty(int(new_value_ptr[-1]), dtype=self.indices.dtype)
         _ops.minor_select_fill(
-            self.value_ptr, self.indices, offsets, positions,
-            kept_slots, new_value_ptr, new_indices,
+            self.value_ptr,
+            self.indices,
+            offsets,
+            positions,
+            kept_slots,
+            new_value_ptr,
+            new_indices,
         )
 
         # Slots keep their original order, so each major slice owns a
@@ -598,9 +623,7 @@ class _VCSBase:
         if isinstance(row_key, int | np.integer) and isinstance(col_key, int | np.integer):
             return self.to_scipy()[row_key, col_key]
 
-        major_key, minor_key = (
-            (col_key, row_key) if self._format == "csc" else (row_key, col_key)
-        )
+        major_key, minor_key = (col_key, row_key) if self._format == "csc" else (row_key, col_key)
         if _is_full_slice(major_key) and _is_full_slice(minor_key):
             return self.copy()
 

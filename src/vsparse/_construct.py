@@ -195,7 +195,9 @@ def transpose_major(
 
     values_out = sorted_value[group_starts]
     value_ptr_out = np.concatenate([group_starts, [nnz]]).astype(np.int64)
-    major_ptr_out = np.searchsorted(sorted_major[group_starts], np.arange(n_minor + 1)).astype(np.int64)
+    major_ptr_out = np.searchsorted(sorted_major[group_starts], np.arange(n_minor + 1)).astype(
+        np.int64
+    )
 
     # The output's minor axis is the input's major axis, so that's the bound.
     indices_out = sorted_minor.astype(smallest_index_dtype(n_major), copy=False)

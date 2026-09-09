@@ -518,9 +518,7 @@ def load_and_normalize(
     del indices, data, row_indptr
 
     normalized = _normalize_and_transform(new_indptr, out_indices, out_data, n_kept_genes)
-    X = csr_array(
-        (normalized, out_indices, new_indptr), shape=(kept_rows.shape[0], n_kept_genes)
-    )
+    X = csr_array((normalized, out_indices, new_indptr), shape=(kept_rows.shape[0], n_kept_genes))
 
     if "obs" in kwargs and "var" in kwargs:
         adata = ad.AnnData(**kwargs)  # ty: ignore[invalid-argument-type]
