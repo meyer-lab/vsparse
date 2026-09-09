@@ -34,10 +34,10 @@ touching every nonzero (once for ``b``, once more for ``c``/``s``, since
 those need ``b`` first), done with parallel numba kernels below, specialized
 per storage format:
 
-- major=columns (VCSC): both passes collapse into one, fully parallel
-  over columns with no cross-thread writes -- each column's own elements
-  carry everything needed to compute both its ``b`` and its ``c``/``s``
-  (:func:`_column_stats_major_is_col`, :func:`_column_gstats_major_is_col`).
+- major=columns (VCSC): both passes collapse into one fused kernel, fully
+  parallel over columns with no cross-thread writes -- each column's own
+  elements carry everything needed to compute both its ``b`` and its
+  ``c``/``s`` (:func:`_column_stats_major_is_col`).
 - major=rows (VCSR): each pass is a scatter-add across columns from
   many rows, so it's parallelized row-chunked with thread-local partial
   column arrays, reduced by summing across threads
@@ -135,44 +135,43 @@ def _g_np(x: np.ndarray, g_code: int) -> np.ndarray:
 
 
 @numba.njit(cache=True, parallel=True)
-def _column_stats_major_is_col(major_ptr, values, value_ptr, indices, row_scale):
-    """``gsum[j] = sum_i values[i, j] / row_scale[i]`` -- the raw material for ``b``."""
-    n_major = major_ptr.shape[0] - 1
-    gsum = np.zeros(n_major, dtype=np.float64)
-    for j in numba.prange(n_major):  # ty: ignore[not-iterable]
-        gs = 0.0
-        for u in range(major_ptr[j], major_ptr[j + 1]):
-            v = values[u]
-            for k in range(value_ptr[u], value_ptr[u + 1]):
-                gs += v / row_scale[indices[k]]
-        gsum[j] = gs
-    return gsum
-
-
-@numba.njit(cache=True, parallel=True)
-def _column_gstats_major_is_col(
-    major_ptr, values, value_ptr, indices, row_scale, gene_scale, g_code
+def _column_stats_major_is_col(
+    major_ptr, values, value_ptr, indices, row_scale, need_b, need_gstats, g_code
 ):
-    """Per-column sum/sum-of-squares of ``g(x / row_scale / gene_scale)`` over stored entries."""
+    """Per-column ``gsum`` (raw material for ``b``) and sum/sum-of-squares of ``g(scaled)``.
+
+    Fused into one pass per column (rather than two separate dispatches):
+    unlike the VCSR scatter passes below, a VCSC column's ``gsum`` depends
+    only on that column's own nonzeros, so it's already final by the time
+    the second (``g``-transform) loop over the same nonzeros needs it --
+    no need to wait for every other column to finish first.
+    """
     n_major = major_ptr.shape[0] - 1
+    gsum = np.ones(n_major, dtype=np.float64)
     col_sum = np.zeros(n_major, dtype=np.float64)
     col_sumsq = np.zeros(n_major, dtype=np.float64)
     for j in numba.prange(n_major):  # ty: ignore[not-iterable]
-        gs = gene_scale[j]
-        if gs <= 0.0:
-            continue
-        s0 = 0.0
-        s1 = 0.0
-        for u in range(major_ptr[j], major_ptr[j + 1]):
-            v = values[u]
-            for k in range(value_ptr[u], value_ptr[u + 1]):
-                scaled = v / row_scale[indices[k]] / gs
-                gy = _g(scaled, g_code)
-                s0 += gy
-                s1 += gy * gy
-        col_sum[j] = s0
-        col_sumsq[j] = s1
-    return col_sum, col_sumsq
+        gs = 1.0
+        if need_b:
+            gs = 0.0
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                v = values[u]
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    gs += v / row_scale[indices[k]]
+            gsum[j] = gs
+        if need_gstats and gs > 0.0:
+            s0 = 0.0
+            s1 = 0.0
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                v = values[u]
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    scaled = v / row_scale[indices[k]] / gs
+                    gy = _g(scaled, g_code)
+                    s0 += gy
+                    s1 += gy * gy
+            col_sum[j] = s0
+            col_sumsq[j] = s1
+    return gsum, col_sum, col_sumsq
 
 
 # -- statistics: major=rows -- scatter-add passes ----------------------------
@@ -347,33 +346,37 @@ class NormalizedViewBase:
         self.row_scale = row_scale
 
         indices = arr.indices  # decode once; shared by both statistics passes below
-        if self.recipe.gene_scale:
-            if self._format == "csc":
-                gsum = _column_stats_major_is_col(
-                    arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale
-                )
-            else:
-                nthreads = numba.get_num_threads()
-                gsum = _scaled_col_sums_vcs(
-                    arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, n_cols, nthreads
-                )
-            gene_scale = gsum
-        else:
-            gene_scale = np.ones(n_cols, dtype=np.float64)
-        self.gene_scale = gene_scale
+        need_b = self.recipe.gene_scale
+        need_gstats = self.recipe.center or self.recipe.post_scale
 
-        if self.recipe.center or self.recipe.post_scale:
-            if self._format == "csc":
-                col_sum, col_sumsq = _column_gstats_major_is_col(
+        if self._format == "csc":
+            # One fused pass per column for both -- see _column_stats_major_is_col.
+            if need_b or need_gstats:
+                gene_scale, col_sum, col_sumsq = _column_stats_major_is_col(
                     arr.major_ptr,
                     arr.values,
                     arr.value_ptr,
                     indices,
                     row_scale,
-                    gene_scale,
+                    need_b,
+                    need_gstats,
                     self.recipe.g_code,
                 )
             else:
+                gene_scale = np.ones(n_cols, dtype=np.float64)
+                col_sum = col_sumsq = np.zeros(n_cols, dtype=np.float64)
+        else:
+            # VCSR can't fuse these: gene_scale[c] isn't final until every row
+            # has been scattered into it, so the g-transform pass has to wait
+            # for the whole first pass to finish -- two genuinely separate passes.
+            if need_b:
+                nthreads = numba.get_num_threads()
+                gene_scale = _scaled_col_sums_vcs(
+                    arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, n_cols, nthreads
+                )
+            else:
+                gene_scale = np.ones(n_cols, dtype=np.float64)
+            if need_gstats:
                 nthreads = numba.get_num_threads()
                 col_sum, col_sumsq = _gstats_col_sums_vcs(
                     arr.major_ptr,
@@ -386,6 +389,11 @@ class NormalizedViewBase:
                     n_cols,
                     nthreads,
                 )
+            else:
+                col_sum = col_sumsq = np.zeros(n_cols, dtype=np.float64)
+        self.gene_scale = gene_scale
+
+        if need_gstats:
             mean = col_sum / n_rows if n_rows > 0 else np.zeros(n_cols, dtype=np.float64)
             variance = np.clip(
                 col_sumsq / n_rows - mean**2 if n_rows > 0 else np.zeros(n_cols), 0.0, None
