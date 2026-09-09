@@ -42,9 +42,7 @@ def _compare(results: dict[str, dict[str, float]], baselines: dict) -> list[str]
             if ceiling is None:
                 continue  # recorded for context, not gated
             if value > ceiling:
-                failures.append(
-                    f"{case}.{metric}: {value:.4g} exceeds ceiling {ceiling:.4g}"
-                )
+                failures.append(f"{case}.{metric}: {value:.4g} exceeds ceiling {ceiling:.4g}")
     return failures
 
 

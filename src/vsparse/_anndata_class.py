@@ -12,6 +12,8 @@ import scipy.sparse as sp
 
 from vsparse import _compression, _io
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
+from vsparse._norm_common import DEFAULT_RECIPE, resolve_recipe
+from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -25,6 +27,13 @@ _DF_KEYS = ("obs", "var")
 _MAPPING_KEYS = ("obsm", "varm", "obsp", "varp", "layers", "uns")
 _FIELD_KEYS = (*_DF_KEYS, *_MAPPING_KEYS)
 _STORE_FORMATS = ("vcsc", "ivcsc")
+
+# Names statistics are recorded under in .obs/.varm/.uns -- see .normalized().
+_VSPARSE_UNS_KEY = "vsparse"
+_VSPARSE_OBS_A = "vsparse_a"
+_VSPARSE_VARM_B = "vsparse_b"
+_VSPARSE_VARM_C = "vsparse_c"
+_VSPARSE_VARM_S = "vsparse_s"
 
 
 def _as_slice_index(idx: Any, n: int) -> Any:
@@ -108,6 +117,7 @@ class VCSCAnnData(ad.AnnData):
             )
         self._vcs_X: _AnyVCS | None = None
         self._vcs_raw_X: _AnyVCS | None = None
+        self._vcs_norm_cache: dict[str, Any] = {}
         shape = kwargs.pop("shape", None)
         if shape is None and X is None and "obs" not in kwargs:
             shape = (0, 0)
@@ -131,7 +141,12 @@ class VCSCAnnData(ad.AnnData):
                 value = vcls.from_scipy(value)
             else:
                 _check_vcs_type(value, "X")
-        if value is not None and hasattr(self, "_obs") and hasattr(self, "_var") and value.shape != self.shape:
+        if (
+            value is not None
+            and hasattr(self, "_obs")
+            and hasattr(self, "_var")
+            and value.shape != self.shape
+        ):
             raise ValueError(f"X shape {value.shape} does not match adata shape {self.shape}")
         self._vcs_X = value
 
@@ -169,18 +184,98 @@ class VCSCAnnData(ad.AnnData):
         obs = cast(pd.DataFrame, self.obs).iloc[oidx].copy()
         var = cast(pd.DataFrame, self.var).iloc[vidx].copy()
 
+        # obs["vsparse_a"]/varm["vsparse_b"/"c"/"s"] get windowed along with
+        # obs/varm below, same as any other per-cell/per-gene column -- each
+        # kept cell/gene keeps its own precomputed factor. But population-level
+        # aspects of those statistics (e.g. the median depth or per-gene mean
+        # baked into them) were derived from the *pre-subset* population, so
+        # they no longer reflect this narrower one -- mark them stale rather
+        # than silently pretending they were computed fresh. Call
+        # .normalized(recalculate=True) to recompute for this subset, or
+        # recalculate=False to keep using these (stale) values.
+        uns = self.uns
+        if _VSPARSE_UNS_KEY in uns:
+            uns = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
+
         return VCSCAnnData(
             X=_subset_2d(self._vcs_X, oidx, vidx),
             raw_X=_subset_2d(self._vcs_raw_X, oidx, vidx),
             obs=obs,
             var=var,
-            uns=self.uns,
+            uns=uns,
             obsm={k: _subset_1d(v, oidx) for k, v in self.obsm.items() if k is not None},
             varm={k: _subset_1d(v, vidx) for k, v in self.varm.items() if k is not None},
             obsp={k: _subset_2d(v, oidx, oidx) for k, v in self.obsp.items() if k is not None},
             varp={k: _subset_2d(v, vidx, vidx) for k, v in self.varp.items() if k is not None},
             layers={k: _subset_2d(v, oidx, vidx) for k, v in self.layers.items() if k is not None},
         )
+
+    # -- normalization ----------------------------------------------------------
+
+    def normalized(self, view: str = DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
+        """A normalized view of ``X`` -- see :meth:`vsparse._base._VCSBase.normalized`.
+
+        Also records the recipe's statistics -- per-cell ``a`` in
+        ``obs["vsparse_a"]``, per-gene ``b``/``c``/``s`` in
+        ``varm["vsparse_b"]``/``["vsparse_c"]``/``["vsparse_s"]``, and the
+        active recipe name plus a ``stale`` flag in ``uns["vsparse"]`` -- so
+        they persist across :meth:`write_h5ad`/:meth:`write_zarr` and can be
+        reused instead of recomputed.
+
+        ``recalculate=False`` reuses whatever is already recorded for
+        ``view``: first an in-memory view already built this session (however
+        it was built), else what's stored in ``obs``/``varm``/``uns`` (built
+        fresh, but skipping the ``O(nnz)`` statistics passes) if it matches
+        ``view`` and the current shape. ``uns["vsparse"]["stale"]`` is set to
+        ``True`` after indexing (see :meth:`__getitem__`), since population
+        statistics like a depth median or a per-gene mean no longer reflect
+        the subset -- ``recalculate=False`` reuses them anyway; the default
+        ``recalculate=True`` always recomputes fresh (and clears ``stale``).
+        """
+        if self._vcs_X is None:
+            raise ValueError("normalized() requires X to be set")
+        recipe = resolve_recipe(view)
+        cache = self._vcs_norm_cache
+        if not recalculate:
+            cached = cache.get(recipe.name)
+            if cached is not None:
+                return cached
+            stored = self.uns.get(_VSPARSE_UNS_KEY)
+            if (
+                stored is not None
+                and stored.get("recipe") == recipe.name
+                and _VSPARSE_OBS_A in self.obs
+                and len(self.obs[_VSPARSE_OBS_A]) == self.n_obs
+                and _VSPARSE_VARM_B in self.varm
+                and _VSPARSE_VARM_C in self.varm
+                and _VSPARSE_VARM_S in self.varm
+                and len(self.varm[_VSPARSE_VARM_B]) == self.n_vars
+            ):
+                nview_cls = (
+                    VCSCArrayNormalized
+                    if isinstance(self._vcs_X, VCSCArray)
+                    else VCSRArrayNormalized
+                )
+                nview = nview_cls.from_stats(
+                    self._vcs_X,
+                    recipe,
+                    a=np.asarray(self.obs[_VSPARSE_OBS_A], dtype=np.float64),
+                    b=np.asarray(self.varm[_VSPARSE_VARM_B], dtype=np.float64).reshape(-1),
+                    c=np.asarray(self.varm[_VSPARSE_VARM_C], dtype=np.float64).reshape(-1),
+                    s=np.asarray(self.varm[_VSPARSE_VARM_S], dtype=np.float64).reshape(-1),
+                    stale=bool(stored.get("stale", False)),
+                )
+                cache[recipe.name] = nview
+                return nview
+
+        nview = self._vcs_X.normalized(recipe.name, recalculate=True)
+        cache[recipe.name] = nview
+        self.obs[_VSPARSE_OBS_A] = nview.a
+        self.varm[_VSPARSE_VARM_B] = nview.b
+        self.varm[_VSPARSE_VARM_C] = nview.c
+        self.varm[_VSPARSE_VARM_S] = nview.s
+        self.uns[_VSPARSE_UNS_KEY] = {"recipe": recipe.name, "stale": False}
+        return nview
 
     # -- conversion -------------------------------------------------------------
 

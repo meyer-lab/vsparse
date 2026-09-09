@@ -60,9 +60,7 @@ def _make_read_vcs(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
         shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
         shape = (shape_vals[0], shape_vals[1])
-        arrays = {
-            name: cast(np.ndarray, _reader.read_elem(elem[name])) for name in _ARRAY_KEYS
-        }
+        arrays = {name: cast(np.ndarray, _reader.read_elem(elem[name])) for name in _ARRAY_KEYS}
         return cls(
             shape,
             arrays["major_ptr"],

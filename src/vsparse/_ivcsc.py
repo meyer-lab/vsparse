@@ -236,7 +236,9 @@ def _group_chunk_boundaries(
     return chunk_group, chunk_byte
 
 
-def _unpack_parallel(value_ptr: np.ndarray, buf: np.ndarray, out: np.ndarray, n_chunks: int) -> None:
+def _unpack_parallel(
+    value_ptr: np.ndarray, buf: np.ndarray, out: np.ndarray, n_chunks: int
+) -> None:
     chunk_group, chunk_byte = _group_chunk_boundaries(value_ptr, buf, n_chunks)
     _decode_chunks(value_ptr, buf, out, chunk_group, chunk_byte)
 

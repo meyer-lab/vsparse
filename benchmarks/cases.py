@@ -5,6 +5,7 @@ from collections.abc import Callable
 import numpy as np
 
 from benchmarks.harness import (
+    best_time,
     integer_counts_csr,
     peak_alloc_mb,
     ratio_vs_scipy,
@@ -137,6 +138,80 @@ def matmat_vs_scipy() -> dict[str, float]:
     rng = np.random.default_rng(0)
     B = rng.normal(size=(mat.shape[1], 8))
     return {"time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ B, lambda: mat @ B)}
+
+
+# -- normalized views (issue #40 recipes): view-op vs materialize-then-op ---
+#
+# For every recipe, the view-based matmul/matvec should cost less, both in
+# time and in peak allocation, than fully materializing the (dense,
+# implicit-zero-filling) normalized matrix and multiplying that -- the whole
+# point of a *view*. ``time_ratio_view_over_materialize`` < 1 and
+# ``peak_alloc_mb_view`` < ``peak_alloc_mb_materialize`` are the expectation
+# for every case below.
+
+
+def _normalized_bench(recipe: str, *, vector: bool) -> Callable[[], dict[str, float]]:
+    def bench() -> dict[str, float]:
+        from vsparse import VCSRArray
+
+        mat = integer_counts_csr(20_000, 2_000, density=0.05)
+        v = VCSRArray.from_scipy(mat)
+        nv = v.normalized(recipe)
+        rng = np.random.default_rng(0)
+        B = rng.normal(size=mat.shape[1]) if vector else rng.normal(size=(mat.shape[1], 8))
+
+        def via_view() -> np.ndarray:
+            return nv @ B
+
+        def via_materialize() -> np.ndarray:
+            return nv.toarray() @ B
+
+        return {
+            "time_ratio_view_over_materialize": best_time(via_view) / best_time(via_materialize),
+            "peak_alloc_mb_view": peak_alloc_mb(via_view),
+            "peak_alloc_mb_materialize": peak_alloc_mb(via_materialize),
+        }
+
+    bench.__name__ = f"normalized_{recipe}_{'matvec' if vector else 'matmat'}_vs_materialize"
+    return bench
+
+
+def _normalized_rbench(recipe: str, *, vector: bool) -> Callable[[], dict[str, float]]:
+    def bench() -> dict[str, float]:
+        from vsparse import VCSCArray
+
+        mat = integer_counts_csr(20_000, 2_000, density=0.05)
+        v = VCSCArray.from_scipy(mat)
+        nv = v.normalized(recipe)
+        rng = np.random.default_rng(0)
+        B = rng.normal(size=mat.shape[0]) if vector else rng.normal(size=(8, mat.shape[0]))
+
+        def via_view() -> np.ndarray:
+            return B @ nv
+
+        def via_materialize() -> np.ndarray:
+            return B @ nv.toarray()
+
+        return {
+            "time_ratio_view_over_materialize": best_time(via_view) / best_time(via_materialize),
+            "peak_alloc_mb_view": peak_alloc_mb(via_view),
+            "peak_alloc_mb_materialize": peak_alloc_mb(via_materialize),
+        }
+
+    bench.__name__ = f"normalized_{recipe}_{'rmatvec' if vector else 'rmatmat'}_vs_materialize"
+    return bench
+
+
+def _register_normalized_benchmarks() -> None:
+    from vsparse import RECIPES
+
+    for recipe in sorted(RECIPES):
+        for vector in (False, True):
+            fast(_normalized_bench(recipe, vector=vector))
+            fast(_normalized_rbench(recipe, vector=vector))
+
+
+_register_normalized_benchmarks()
 
 
 # -- larger, for the scheduled job -------------------------------------------
