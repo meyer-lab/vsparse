@@ -391,3 +391,81 @@ def test_anndata_cache_does_not_pin_a_dropped_view():
     assert ref() is None
     # Still reusable -- from obs/varm/uns if not from the retained statistics.
     assert adata.normalized("scanpy", recalculate=False) is not None
+
+
+# -- sparse materialization ---------------------------------------------------
+
+
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+def test_delta_plus_baseline_reconstructs_the_view(vcls, dense, recipe):
+    """``Y == Delta + 1 (x) baseline`` -- the decomposition every kernel assumes."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized(recipe)
+    recon = nv.sparse_delta().toarray() + nv.baseline[None, :]
+    np.testing.assert_allclose(recon, nv.toarray(), rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+def test_is_sparse_matches_whether_the_baseline_vanishes(vcls, dense, recipe):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized(recipe)
+    assert nv.is_sparse == (not RECIPES[recipe].center)
+    if nv.is_sparse:
+        np.testing.assert_allclose(nv.baseline, 0.0)
+
+
+@pytest.mark.parametrize("recipe", ["raw", "cp10k_log1p"])
+def test_to_scipy_is_exact_for_uncentered_recipes(vcls, dense, recipe):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized(recipe)
+    expected = nv.toarray()
+    np.testing.assert_allclose(nv.to_scipy().toarray(), expected, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(nv.to_csr().toarray(), expected, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(nv.to_csc().toarray(), expected, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("recipe", ["parafac2", "scanpy", "pearson"])
+def test_to_scipy_refuses_centered_recipes(vcls, dense, recipe):
+    """Centering sends every structural zero to -c*s, so there is no sparse Y."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized(recipe)
+    for call in (nv.to_scipy, nv.to_csr, nv.to_csc):
+        with pytest.raises(ValueError, match="sparse_delta"):
+            call()
+
+
+def test_sparse_delta_returns_the_wrapped_layout_by_default(vcls, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized("parafac2")
+    native = "csc" if vcls is VCSCArray else "csr"
+    assert nv.sparse_delta().format == native
+    assert nv.sparse_delta("csr").format == "csr"
+    assert nv.sparse_delta("csc").format == "csc"
+
+
+def test_sparse_delta_stores_no_more_entries_than_the_input(vcls, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    assert v.normalized("parafac2").sparse_delta().nnz <= v.nnz
+
+
+def test_sparse_delta_matmul_agrees_with_the_view(vcls, dense):
+    """The decomposition is what `@` uses, so it had better agree with it."""
+    if dense.sum() == 0 or dense.shape[1] == 0:
+        pytest.skip("degenerate shape")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized("parafac2")
+    B = np.random.default_rng(0).normal(size=(dense.shape[1], 3))
+    via_delta = nv.sparse_delta() @ B + (nv.baseline @ B)
+    np.testing.assert_allclose(nv @ B, via_delta, rtol=1e-9, atol=1e-9)

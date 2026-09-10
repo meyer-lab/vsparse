@@ -12,7 +12,9 @@
     "cpu_ratio_1t_parafac2": 1.5,
     "cpu_ratio_1t_pearson": 1.5,
     "cpu_ratio_1t_raw": 1.5,
-    "cpu_ratio_1t_scanpy": 1.5
+    "cpu_ratio_1t_scanpy": 1.5,
+    "sparse_materialize_mb_d005": 1.1,
+    "sparse_materialize_mb_d001": 1.1
   },
   "cases": {
     "layout_bytes_per_nonzero": {
@@ -157,6 +159,10 @@
       "cpu_ratio_1t_pearson": 2.85,
       "cpu_ratio_1t_raw": 2.445,
       "cpu_ratio_1t_scanpy": 7.845
+    },
+    "normalized_materialize_sparse_vs_dense": {
+      "sparse_materialize_mb_d005": 70.752,
+      "sparse_materialize_mb_d001": 14.432
     }
   }
 }

@@ -59,6 +59,9 @@ from typing import Any
 
 import numba
 import numpy as np
+import scipy.sparse as sp
+
+from vsparse import _construct
 
 __all__ = [
     "DEFAULT_RECIPE",
@@ -320,6 +323,42 @@ def _gstats_col_sums_vcs(
                         local_sum[c] += gy
                         local_sumsq[c] += gy * gy
     return partial_sum.sum(axis=0), partial_sumsq.sum(axis=0)
+
+
+# -- sparse materialization ---------------------------------------------------
+#
+# `Delta` is the normalized matrix minus its rank-1 dense part: since every
+# recipe's `g` has `g(0) == 0`, an implicit zero maps to exactly `-c[j] * s[j]`
+# regardless of the row, so
+#
+#     Y = Delta + 1 (x) baseline,   baseline[j] = -c[j] * s[j]
+#
+# with `Delta` zero off the stored nonzeros. For an uncentered recipe the
+# baseline is zero and `Delta` *is* `Y`, exactly -- which is what makes
+# `to_scipy()` lossless there.
+#
+# Both kernels rewrite the decompressed `data` array in place, parallel over
+# the major axis (whose slices own disjoint stretches of `data`), so nothing
+# `nnz`-sized is allocated beyond the output itself.
+
+
+@numba.njit(cache=True, parallel=True)
+def _apply_delta_major_is_row(major_ptr, indices, data, row_scale, gene_scale, s, g_code):
+    for i in numba.prange(major_ptr.shape[0] - 1):  # ty: ignore[not-iterable]
+        rs = row_scale[i]
+        for k in range(major_ptr[i], major_ptr[i + 1]):
+            j = indices[k]
+            gs = gene_scale[j]
+            data[k] = 0.0 if gs <= 0.0 else s[j] * _g(data[k] / rs / gs, g_code)
+
+
+@numba.njit(cache=True, parallel=True)
+def _apply_delta_major_is_col(major_ptr, indices, data, row_scale, gene_scale, s, g_code):
+    for j in numba.prange(major_ptr.shape[0] - 1):  # ty: ignore[not-iterable]
+        gs = gene_scale[j]
+        sj = s[j]
+        for k in range(major_ptr[j], major_ptr[j + 1]):
+            data[k] = 0.0 if gs <= 0.0 else sj * _g(data[k] / row_scale[indices[k]] / gs, g_code)
 
 
 # -- full materialization -----------------------------------------------------
@@ -663,6 +702,81 @@ class NormalizedViewBase:
                 out,
             )
         return out
+
+    @property
+    def is_sparse(self) -> bool:
+        """Whether the normalized matrix is still sparse.
+
+        False exactly when the recipe centers: a nonzero ``c`` sends every
+        structural zero to ``-c[j] * s[j]``, so the result is dense in
+        general no matter how few nonzeros the input had.
+        """
+        return not self.recipe.center
+
+    @property
+    def baseline(self) -> np.ndarray:
+        """``-c * s`` -- the value every structural zero takes, one per column."""
+        return -self.col_mean * self.col_post_scale
+
+    def sparse_delta(self, fmt: str | None = None) -> Any:
+        """``Delta`` as scipy sparse, where ``Y == Delta + 1 (x) baseline``.
+
+        Always available, for every recipe. For an uncentered recipe
+        :attr:`baseline` is zero and this *is* the normalized matrix -- see
+        :meth:`to_scipy`, which says so in its return type instead of leaving
+        the caller to check.
+
+        Parameters
+        ----------
+        fmt
+            ``"csr"``/``"csc"``, or ``None`` (the default) for whichever
+            matches the wrapped array's own layout, which costs no conversion.
+        """
+        arr = self._arr
+        major_ptr, indices, data = _construct.decompress(
+            arr.major_ptr, arr.values, arr.value_ptr, arr.indices, arr.major_ptr.shape[0] - 1
+        )
+        data = np.asarray(data, dtype=np.float64)
+        kernel = _apply_delta_major_is_col if self._format == "csc" else _apply_delta_major_is_row
+        kernel(
+            major_ptr,
+            indices,
+            data,
+            self.row_scale,
+            self.gene_scale,
+            self.col_post_scale,
+            self.recipe.g_code,
+        )
+        cls = sp.csc_array if self._format == "csc" else sp.csr_array
+        out = cls((data, indices, major_ptr), shape=self.shape)
+        if fmt is None or fmt == self._format:
+            return out
+        return out.tocsr() if fmt == "csr" else out.tocsc()
+
+    def to_scipy(self) -> Any:
+        """The normalized matrix as scipy sparse, in the wrapped array's own layout.
+
+        Only defined when :attr:`is_sparse` -- a centering recipe has no
+        sparse representation of ``Y`` at all, because every structural zero
+        carries ``-c[j] * s[j]``. For those, take :meth:`sparse_delta` plus
+        :attr:`baseline` (which is what ``@`` does internally), or
+        :meth:`toarray` if you genuinely want the dense matrix.
+        """
+        if not self.is_sparse:
+            raise ValueError(
+                f"recipe {self.recipe.name!r} centers, so the normalized matrix is dense: "
+                f"every structural zero holds -c*s. Use .sparse_delta() together with "
+                f".baseline (Y == delta + 1 (x) baseline), or .toarray()."
+            )
+        return self.sparse_delta()
+
+    def to_csr(self) -> Any:
+        """:meth:`to_scipy` as CSR."""
+        return self.to_scipy().tocsr()
+
+    def to_csc(self) -> Any:
+        """:meth:`to_scipy` as CSC."""
+        return self.to_scipy().tocsc()
 
     # -- selection ---------------------------------------------------------------
 

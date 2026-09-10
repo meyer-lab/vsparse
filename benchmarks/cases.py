@@ -351,6 +351,42 @@ def normalized_cpu_vs_sparse_1t() -> dict[str, float]:
     return out
 
 
+@fast
+def normalized_materialize_sparse_vs_dense() -> dict[str, float]:
+    """Sparse vs dense materialization of a normalized view.
+
+    `raw` is uncentered, so `sparse_delta()` *is* the normalized matrix and
+    `toarray()` is a strictly worse way to get it -- the ratio here is just
+    the density. Recorded at two densities because that ratio is the whole
+    point: the sparser the data, the more the dense path wastes.
+
+    Time is recorded for context and is currently *worse*, which is not the
+    transform's doing: nearly all of `sparse_delta()` is
+    `_construct.decompress`, which is single-threaded and costs
+    `VCSRArray.to_scipy()` the same today, while `toarray()` fills its buffer
+    with a `parallel=True` kernel. Parallelizing decompress fixes both.
+    """
+    from vsparse import VCSRArray
+
+    out = {}
+    for density in (0.05, 0.01):
+        gc.collect()
+        mat = integer_counts_csr(40_000, 2_000, density=density)
+        nv = VCSRArray.from_scipy(mat).normalized("raw")
+        tag = f"{density:g}".replace(".", "")
+
+        delta = nv.sparse_delta()
+        sparse_mb = (delta.data.nbytes + delta.indices.nbytes + delta.indptr.nbytes) / 1e6
+        dense_mb = nv.shape[0] * nv.shape[1] * 8 / 1e6
+        out[f"dense_over_sparse_bytes_d{tag}"] = dense_mb / sparse_mb
+        out[f"sparse_materialize_mb_d{tag}"] = sparse_mb
+        out[f"time_ratio_sparse_over_dense_d{tag}"] = best_time(
+            nv.sparse_delta, repeat=3
+        ) / best_time(nv.toarray, repeat=3)
+        del delta, nv, mat
+    return out
+
+
 # -- larger, for the scheduled job -------------------------------------------
 
 
