@@ -7,7 +7,12 @@
     "peak_alloc_mb": 2.0,
     "time_ratio_vs_scipy": 4.0,
     "peak_alloc_mb_view": 2.0,
-    "time_ratio_view_over_materialize": 4.0
+    "time_ratio_view_over_materialize": 4.0,
+    "cpu_ratio_1t_cp10k_log1p": 1.5,
+    "cpu_ratio_1t_parafac2": 1.5,
+    "cpu_ratio_1t_pearson": 1.5,
+    "cpu_ratio_1t_raw": 1.5,
+    "cpu_ratio_1t_scanpy": 1.5
   },
   "cases": {
     "layout_bytes_per_nonzero": {
@@ -115,6 +120,43 @@
     "normalized_scanpy_rmatvec_vs_materialize": {
       "time_ratio_view_over_materialize": 0.3,
       "peak_alloc_mb_view": 0.1321
+    },
+    "normalized_cp10k_log1p_matmat_vs_sparse": {
+      "peak_alloc_mb_view": 2.7262
+    },
+    "normalized_cp10k_log1p_matvec_vs_sparse": {
+      "peak_alloc_mb_view": 0.3858
+    },
+    "normalized_parafac2_matmat_vs_sparse": {
+      "peak_alloc_mb_view": 2.7262
+    },
+    "normalized_parafac2_matvec_vs_sparse": {
+      "peak_alloc_mb_view": 0.3858
+    },
+    "normalized_pearson_matmat_vs_sparse": {
+      "peak_alloc_mb_view": 2.7262
+    },
+    "normalized_pearson_matvec_vs_sparse": {
+      "peak_alloc_mb_view": 0.3858
+    },
+    "normalized_raw_matmat_vs_sparse": {
+      "peak_alloc_mb_view": 2.7262
+    },
+    "normalized_raw_matvec_vs_sparse": {
+      "peak_alloc_mb_view": 0.3858
+    },
+    "normalized_scanpy_matmat_vs_sparse": {
+      "peak_alloc_mb_view": 2.7262
+    },
+    "normalized_scanpy_matvec_vs_sparse": {
+      "peak_alloc_mb_view": 0.3858
+    },
+    "normalized_cpu_vs_sparse_1t": {
+      "cpu_ratio_1t_cp10k_log1p": 7.815,
+      "cpu_ratio_1t_parafac2": 8.91,
+      "cpu_ratio_1t_pearson": 2.85,
+      "cpu_ratio_1t_raw": 2.445,
+      "cpu_ratio_1t_scanpy": 7.845
     }
   }
 }

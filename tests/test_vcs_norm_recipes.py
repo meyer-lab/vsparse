@@ -285,12 +285,14 @@ def test_custom_recipe_works_on_the_anndata():
     adata = _small_adata(rng)
     recipe = _custom_recipe()
     nv = adata.normalized(recipe)
+    raw = adata.X
+    assert raw is not None
 
     assert nv.recipe is recipe
     assert adata.uns["vsparse"]["recipe"] == "custom_cp10k_scaled"
     np.testing.assert_allclose(adata.obs["vsparse_a"].to_numpy(), nv.a)
     np.testing.assert_allclose(
-        nv.toarray(), _reference(np.asarray(adata.X.toarray()), "scanpy"), atol=1e-6
+        nv.toarray(), _reference(np.asarray(raw.toarray()), "scanpy"), atol=1e-6
     )
 
 
