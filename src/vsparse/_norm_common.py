@@ -52,13 +52,22 @@ each supply their own ``__matmul__``/``__rmatmul__`` wired to those kernels.
 
 from __future__ import annotations
 
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
 import numba
 import numpy as np
 
-__all__ = ["DEFAULT_RECIPE", "RECIPES", "NormalizedViewBase", "Recipe", "resolve_recipe"]
+__all__ = [
+    "DEFAULT_RECIPE",
+    "NORM_CACHE_MAXSIZE",
+    "RECIPES",
+    "NormalizedViewBase",
+    "Recipe",
+    "resolve_recipe",
+]
 
 
 # -- recipes ------------------------------------------------------------------
@@ -114,6 +123,86 @@ def resolve_recipe(view: str | Recipe) -> Recipe:
         raise ValueError(
             f"unknown normalization view {view!r}; choose from {sorted(RECIPES)}"
         ) from None
+
+
+# -- cache --------------------------------------------------------------------
+
+#: How many distinct recipes one array keeps statistics for. The cache exists so
+#: that switching back and forth between a handful of recipes doesn't repeat the
+#: ``O(nnz)`` passes; past that many, the least recently used entry is dropped.
+#: Each entry costs ``8 * (n_rows + 3 * n_cols)`` bytes, dominated by
+#: ``row_scale`` -- ~800 MB per entry at 100M cells, so this is deliberately small.
+NORM_CACHE_MAXSIZE = 4
+
+
+class _NormCache:
+    """Bounded LRU of computed normalizations for one array, keyed by :class:`Recipe`.
+
+    Holds each view's *statistics* strongly and the view itself only weakly.
+    That split matters: a view can carry an ``O(nnz)`` ``_dual_arr`` (a whole
+    opposite-format copy of the array, cached by the matmul kernels), and a
+    cache that kept views alive would pin one of those per recipe for as long
+    as the array lived, even after the caller had dropped every reference.
+    The statistics are ``O(n_rows + n_cols)``, so retaining those is cheap.
+
+    A hit on a still-live view hands back that exact object, so
+    ``recalculate=False`` is identity-stable for as long as the caller holds
+    it. A hit on a view that has since been collected rebuilds one from the
+    retained statistics -- which is what the cache is actually for, since that
+    skips the ``O(nnz)`` passes.
+    """
+
+    __slots__ = ("_entries", "maxsize")
+
+    def __init__(self, maxsize: int = NORM_CACHE_MAXSIZE) -> None:
+        # recipe -> (weakref to the view, view class, row_scale, gene_scale,
+        #            col_mean, col_post_scale, stale). Insertion-ordered, so the
+        #            first key is the least recently used.
+        self._entries: OrderedDict[Recipe, tuple[Any, ...]] = OrderedDict()
+        self.maxsize = maxsize
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, recipe: Recipe) -> bool:
+        return recipe in self._entries
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+    def get(self, recipe: Recipe, arr: Any) -> Any | None:
+        """The cached view for ``recipe`` over ``arr``, or ``None`` if there is none."""
+        entry = self._entries.get(recipe)
+        if entry is None:
+            return None
+        self._entries.move_to_end(recipe)
+        ref, cls, row_scale, gene_scale, col_mean, col_post_scale, stale = entry
+        view = ref()
+        if view is not None and view._arr is arr:
+            return view
+        return cls._from_internal_stats(
+            arr,
+            recipe,
+            row_scale=row_scale,
+            gene_scale=gene_scale,
+            col_mean=col_mean,
+            col_post_scale=col_post_scale,
+            stale=stale,
+        )
+
+    def put(self, recipe: Recipe, view: Any) -> None:
+        self._entries[recipe] = (
+            weakref.ref(view),
+            type(view),
+            view.row_scale,
+            view.gene_scale,
+            view.col_mean,
+            view.col_post_scale,
+            view.stale,
+        )
+        self._entries.move_to_end(recipe)
+        while len(self._entries) > self.maxsize:
+            self._entries.popitem(last=False)
 
 
 # -- elementwise transform ----------------------------------------------------
@@ -337,7 +426,16 @@ class NormalizedViewBase:
 
     __array_ufunc__ = None
 
-    __slots__ = ("_arr", "col_mean", "col_post_scale", "gene_scale", "recipe", "row_scale", "stale")
+    __slots__ = (
+        "__weakref__",  # so _NormCache can hold a view without pinning it
+        "_arr",
+        "col_mean",
+        "col_post_scale",
+        "gene_scale",
+        "recipe",
+        "row_scale",
+        "stale",
+    )
 
     def __init__(
         self, arr: Any, recipe: str | Recipe = DEFAULT_RECIPE, *, stale: bool = False
@@ -446,16 +544,45 @@ class NormalizedViewBase:
             raise ValueError(
                 f"{cls.__name__} wraps a {cls._format!r}-format array, got {type(arr).__name__}"
             )
-        self = object.__new__(cls)
-        self._arr = arr
-        self.recipe = resolve_recipe(recipe)
-        self.stale = stale
         a = np.asarray(a, dtype=np.float64)
         b = np.asarray(b, dtype=np.float64)
-        self.row_scale = np.where(a > 0.0, 1.0 / a, 0.0)
-        self.gene_scale = np.where(b > 0.0, 1.0 / b, 0.0)
-        self.col_mean = np.asarray(c, dtype=np.float64)
-        self.col_post_scale = np.asarray(s, dtype=np.float64)
+        return cls._from_internal_stats(
+            arr,
+            resolve_recipe(recipe),
+            row_scale=np.where(a > 0.0, 1.0 / a, 0.0),
+            gene_scale=np.where(b > 0.0, 1.0 / b, 0.0),
+            col_mean=np.asarray(c, dtype=np.float64),
+            col_post_scale=np.asarray(s, dtype=np.float64),
+            stale=stale,
+        )
+
+    @classmethod
+    def _from_internal_stats(
+        cls,
+        arr: Any,
+        recipe: Recipe,
+        *,
+        row_scale: np.ndarray,
+        gene_scale: np.ndarray,
+        col_mean: np.ndarray,
+        col_post_scale: np.ndarray,
+        stale: bool,
+    ) -> NormalizedViewBase:
+        """Attach already-computed *internal* statistics to a fresh view.
+
+        The reciprocals :attr:`a`/:attr:`b` expose are not exactly involutive in
+        float64, so anything restoring a view it built earlier (see
+        :class:`_NormCache`) has to carry these arrays rather than round-trip
+        through ``a``/``b``.
+        """
+        self = object.__new__(cls)
+        self._arr = arr
+        self.recipe = recipe
+        self.stale = stale
+        self.row_scale = row_scale
+        self.gene_scale = gene_scale
+        self.col_mean = col_mean
+        self.col_post_scale = col_post_scale
         self._init_extra()
         return self
 

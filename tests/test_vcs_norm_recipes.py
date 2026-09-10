@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -16,6 +19,7 @@ from vsparse import (
     VCSRArray,
     VCSRArrayNormalized,
 )
+from vsparse._norm_common import NORM_CACHE_MAXSIZE
 
 
 @pytest.fixture(params=[VCSCArray, VCSRArray])
@@ -177,7 +181,7 @@ def test_indexing_the_raw_array_starts_with_an_empty_cache(vcls, dense):
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     v.normalized("parafac2")
     sub = v[0:1, :]
-    assert sub._norm_cache == {}
+    assert len(sub._norm_cache) == 0
 
 
 # -- select() carries the recipe forward --------------------------------------
@@ -319,3 +323,69 @@ def test_recipe_with_an_unknown_g_code_is_rejected(vcls, dense):
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     with pytest.raises(ValueError, match="unknown g_code"):
         v.normalized(Recipe("bogus", None, False, 99, False, False))
+
+
+# -- cache eviction -----------------------------------------------------------
+
+
+def test_cache_does_not_pin_a_dropped_view(vcls, dense):
+    """The cache holds views weakly, so it can't keep an O(nnz) _dual_arr alive."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    ref = weakref.ref(v.normalized("parafac2"))
+    gc.collect()
+    assert ref() is None, "cached view outlived the caller's last reference"
+    assert len(v._norm_cache) == 1, "the statistics themselves should still be cached"
+
+
+def test_cache_rebuilds_an_evicted_view_from_retained_statistics(vcls, dense):
+    """A collected view is rebuilt exactly, without redoing the O(nnz) passes."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    first = v.normalized("scanpy")
+    expected = first.toarray()
+    row_scale, gene_scale = first.row_scale, first.gene_scale
+    del first
+    gc.collect()
+
+    again = v.normalized("scanpy", recalculate=False)
+    # Bit-identical, not merely close: the internal arrays are carried over
+    # rather than round-tripped through the a/b reciprocals.
+    np.testing.assert_array_equal(again.row_scale, row_scale)
+    np.testing.assert_array_equal(again.gene_scale, gene_scale)
+    np.testing.assert_array_equal(again.toarray(), expected)
+
+
+def test_cache_is_bounded_and_evicts_least_recently_used(vcls, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    names = sorted(RECIPES)
+    assert len(names) > NORM_CACHE_MAXSIZE, "test needs more recipes than the cache holds"
+
+    held = [v.normalized(n) for n in names]
+    assert len(v._norm_cache) == NORM_CACHE_MAXSIZE
+    # The first recipe touched is the one dropped.
+    assert RECIPES[names[0]] not in v._norm_cache
+    assert RECIPES[names[-1]] in v._norm_cache
+    assert len(held) == len(names)
+
+
+def test_cache_hit_is_identity_stable_while_the_caller_holds_the_view(vcls, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized("parafac2")
+    assert v.normalized("parafac2", recalculate=False) is nv
+
+
+def test_anndata_cache_does_not_pin_a_dropped_view():
+    rng = np.random.default_rng(0)
+    adata = _small_adata(rng)
+    ref = weakref.ref(adata.normalized("scanpy"))
+    gc.collect()
+    assert ref() is None
+    # Still reusable -- from obs/varm/uns if not from the retained statistics.
+    assert adata.normalized("scanpy", recalculate=False) is not None

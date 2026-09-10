@@ -23,6 +23,7 @@ from vsparse._indexutils import normalize_major_idx as _normalize_major_idx
 from vsparse._indexutils import smallest_index_dtype as _smallest_index_dtype
 from vsparse._norm_common import DEFAULT_RECIPE as _DEFAULT_RECIPE
 from vsparse._norm_common import Recipe as _Recipe
+from vsparse._norm_common import _NormCache
 
 __all__ = ["VCSCArray", "VCSRArray"]
 
@@ -79,7 +80,7 @@ class _VCSBase:
         self.values = values
         self.value_ptr = value_ptr
         self.indices = indices
-        self._norm_cache: dict[Any, Any] = {}
+        self._norm_cache = _NormCache()
 
     # -- axis bookkeeping ------------------------------------------------
 
@@ -218,6 +219,9 @@ class _VCSBase:
             ``recalculate``) -- this is how switching between recipes avoids
             recomputing each one every time. If no such view has been
             computed yet, one is still computed (there is nothing to reuse).
+            The cache holds at most
+            :data:`~vsparse._norm_common.NORM_CACHE_MAXSIZE` recipes, and holds
+            each view weakly -- see :class:`~vsparse._norm_common._NormCache`.
         """
         from vsparse._norm_common import resolve_recipe
         from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
@@ -225,13 +229,13 @@ class _VCSBase:
         recipe = resolve_recipe(view)
         cache = self._norm_cache
         if not recalculate:
-            cached = cache.get(recipe)
+            cached = cache.get(recipe, self)
             if cached is not None:
                 return cached
 
         cls = VCSCArrayNormalized if self._format == "csc" else VCSRArrayNormalized
         result = cls(self, recipe)
-        cache[recipe] = result
+        cache.put(recipe, result)
         return result
 
     def log1p(self) -> _VCSBase:
