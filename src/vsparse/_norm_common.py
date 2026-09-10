@@ -95,8 +95,18 @@ RECIPES: dict[str, Recipe] = {
 DEFAULT_RECIPE = "parafac2"
 
 
+#: Every ``g`` :func:`_g` knows how to apply. A ``Recipe`` carrying anything
+#: else would silently fall through to the identity branch, so reject it here.
+_G_CODES = frozenset({G_IDENTITY, G_LOG1P, G_LOG1P_1000X, G_SQRT})
+
+
 def resolve_recipe(view: str | Recipe) -> Recipe:
     if isinstance(view, Recipe):
+        if view.g_code not in _G_CODES:
+            raise ValueError(
+                f"recipe {view.name!r} has unknown g_code {view.g_code!r}; "
+                f"choose from {sorted(_G_CODES)}"
+            )
         return view
     try:
         return RECIPES[view]
