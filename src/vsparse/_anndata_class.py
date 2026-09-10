@@ -12,7 +12,7 @@ import scipy.sparse as sp
 
 from vsparse import _compression, _io
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
-from vsparse._norm_common import DEFAULT_RECIPE, Recipe, resolve_recipe
+from vsparse._norm_common import DEFAULT_RECIPE, Recipe, _NormCache, resolve_recipe
 from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ class VCSCAnnData(ad.AnnData):
             )
         self._vcs_X: _AnyVCS | None = None
         self._vcs_raw_X: _AnyVCS | None = None
-        self._vcs_norm_cache: dict[Any, Any] = {}
+        self._vcs_norm_cache = _NormCache()
         shape = kwargs.pop("shape", None)
         if shape is None and X is None and "obs" not in kwargs:
             shape = (0, 0)
@@ -237,7 +237,7 @@ class VCSCAnnData(ad.AnnData):
         recipe = resolve_recipe(view)
         cache = self._vcs_norm_cache
         if not recalculate:
-            cached = cache.get(recipe)
+            cached = cache.get(recipe, self._vcs_X)
             if cached is not None:
                 return cached
             stored = self.uns.get(_VSPARSE_UNS_KEY)
@@ -265,11 +265,11 @@ class VCSCAnnData(ad.AnnData):
                     s=np.asarray(self.varm[_VSPARSE_VARM_S], dtype=np.float64).reshape(-1),
                     stale=bool(stored.get("stale", False)),
                 )
-                cache[recipe] = nview
+                cache.put(recipe, nview)
                 return nview
 
         nview = self._vcs_X.normalized(recipe, recalculate=True)
-        cache[recipe] = nview
+        cache.put(recipe, nview)
         self.obs[_VSPARSE_OBS_A] = nview.a
         self.varm[_VSPARSE_VARM_B] = nview.b
         self.varm[_VSPARSE_VARM_C] = nview.c
