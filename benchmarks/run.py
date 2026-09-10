@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,11 +21,18 @@ BASELINES = Path(__file__).with_name("baselines.json")
 
 
 def _run_one_in_subprocess(name: str) -> dict[str, float]:
+    env = os.environ.copy()
+    if name.endswith("_1t"):
+        # Has to be set before numba is imported, which is why these cases are
+        # named rather than configured: capping the pool at runtime leaves the
+        # idle workers spinning, and process_time() counts them.
+        env["NUMBA_NUM_THREADS"] = "1"
     proc = subprocess.run(
         [sys.executable, "-m", "benchmarks.run", "--emit", name],
         capture_output=True,
         text=True,
         cwd=Path(__file__).resolve().parent.parent,
+        env=env,
         check=False,
     )
     if proc.returncode != 0:

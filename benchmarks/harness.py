@@ -39,6 +39,24 @@ def best_time(fn: Callable[[], Any], repeat: int = 7) -> float:
     return best
 
 
+def best_cpu_time(fn: Callable[[], Any], repeat: int = 7) -> float:
+    """Best *CPU* time over ``repeat`` runs, in seconds. Warms up first.
+
+    Wall time alone flatters every numba kernel here: they are ``parallel=True``
+    while scipy's sparse matmul is single-threaded, so a kernel can be several
+    times faster on the clock while burning an order of magnitude more CPU.
+    On a shared workstation -- the machine this project is aimed at -- that
+    difference is what the user actually pays.
+    """
+    fn()
+    best = float("inf")
+    for _ in range(repeat):
+        start = time.process_time()
+        fn()
+        best = min(best, time.process_time() - start)
+    return best
+
+
 def ratio_vs_scipy(ours: Callable[[], Any], theirs: Callable[[], Any], repeat: int = 7) -> float:
     """``our time / scipy's time`` for the same work."""
     return best_time(ours, repeat) / best_time(theirs, repeat)
