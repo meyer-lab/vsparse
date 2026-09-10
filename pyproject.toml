@@ -37,6 +37,9 @@ docs = [
     "myst-parser>=3.0",
     "sphinx-autodoc-typehints>=2.0",
 ]
+cuda = [
+    "cupy-cuda12x>=13.0",
+]
 
 [dependency-groups]
 dev = [
@@ -66,7 +69,14 @@ python-version = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# "-p no:zarr": zarr registers a pytest plugin (`zarr.testing`) that pytest
+# autoloads before any test/conftest code runs, which imports
+# `zarr.core.buffer.gpu` -> `cupy` speculatively. CuPy's CUDA-toolkit-header
+# discovery misbehaves for the rest of the process if cupy's first import
+# happens that way rather than via `vsparse` (see `vsparse/__init__.py`'s
+# import-order comment) -- disabling the plugin avoids that first import
+# happening before vsparse gets a chance to configure things.
+addopts = "-ra -p no:zarr"
 
 [tool.coverage.run]
 source = ["src/vsparse"]

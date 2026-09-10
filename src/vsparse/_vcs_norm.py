@@ -9,6 +9,14 @@ materializing it. See :mod:`vsparse._norm_common` for the shared recipe/
 statistics/materialization logic (:class:`~vsparse._norm_common.NormalizedViewBase`)
 and :mod:`vsparse._vcs_matmul` for the matmul kernels these use (a direct
 per-nonzero walk over the already-decoded ``indices`` array).
+
+Call :meth:`~_VCSNormalizedBase.to_gpu` for a device-resident counterpart
+(:class:`~vsparse._vcs_matmul_cuda.GPUNormalizedVCS`) whose own ``@``/
+``__rmatmul__`` run CUDA kernels in float32 -- see
+:mod:`vsparse._vcs_matmul_cuda`. This is opt-in, not automatic: ``@``/
+``__rmatmul__`` on the CPU view here always use the float64 Numba kernels,
+regardless of whether a CUDA device is present, so existing behavior and
+precision are unaffected by whether CuPy/CUDA happen to be installed.
 """
 
 from __future__ import annotations
@@ -52,6 +60,21 @@ class _VCSNormalizedBase(NormalizedViewBase):
         from vsparse._vcs_matmul import dense_at_normalized
 
         return dense_at_normalized(self, other)
+
+    def to_gpu(self) -> Any:
+        """A device-resident :class:`~vsparse._vcs_matmul_cuda.GPUNormalizedVCS` copy of this view.
+
+        Explicit and one-way: building it uploads/regroups this view's
+        arrays onto the GPU once (cached on the returned object across
+        repeated ``@``/``__rmatmul__`` calls against it), but nothing about
+        the CPU view itself changes, and nothing here is created implicitly
+        just because a CUDA device happens to be available. Requires CuPy
+        and a working CUDA device -- see
+        :func:`vsparse._vcs_matmul_cuda.cuda_available`.
+        """
+        from vsparse._vcs_matmul_cuda import GPUNormalizedVCS
+
+        return GPUNormalizedVCS(self)
 
 
 class VCSCArrayNormalized(_VCSNormalizedBase):
