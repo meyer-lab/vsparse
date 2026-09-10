@@ -22,6 +22,7 @@ from vsparse._indexutils import is_full_slice as _is_full_slice
 from vsparse._indexutils import normalize_major_idx as _normalize_major_idx
 from vsparse._indexutils import smallest_index_dtype as _smallest_index_dtype
 from vsparse._norm_common import DEFAULT_RECIPE as _DEFAULT_RECIPE
+from vsparse._norm_common import Recipe
 
 __all__ = ["VCSCArray", "VCSRArray"]
 
@@ -199,7 +200,9 @@ class _VCSBase:
         )
         return other_cls(self.shape, major_ptr, values, value_ptr, indices)
 
-    def normalized(self, view: str = _DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
+    def normalized(
+        self, view: str | Recipe = _DEFAULT_RECIPE, *, recalculate: bool = True
+    ) -> Any:
         """A normalized *view* of this array -- see :mod:`vsparse._vcs_norm`/:mod:`vsparse._norm_common`.
 
         Parameters
@@ -207,7 +210,8 @@ class _VCSBase:
         view
             Which normalization recipe to apply -- one of
             :data:`vsparse._norm_common.RECIPES` (``"raw"``, ``"cp10k_log1p"``,
-            ``"parafac2"`` (the default), ``"scanpy"``, ``"pearson"``).
+            ``"parafac2"`` (the default), ``"scanpy"``, ``"pearson"``), or a
+            custom :class:`~vsparse._norm_common.Recipe` instance directly.
         recalculate
             If ``True`` (the default), (re)compute the recipe's statistics
             fresh from this array. If ``False``, reuse a previously computed
