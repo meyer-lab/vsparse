@@ -139,6 +139,62 @@ def matmat_vs_scipy() -> dict[str, float]:
     return {"time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ B, lambda: mat @ B)}
 
 
+# -- misaligned direction of the *core* matmul path --------------------------
+#
+# `matvec_vs_scipy`/`matmat_vs_scipy` above run VCSR in its aligned direction.
+# These run the other one -- the scatter path in `_ops` -- which is where the
+# array's layout works against the product and where the serial kernel used to
+# lose to scipy by up to 4x.
+
+
+@fast
+def misaligned_matvec_vs_scipy() -> dict[str, float]:
+    """``VCSC @ x``: iterate columns, scatter into rows."""
+    import scipy.sparse as sp
+
+    from vsparse import VCSCArray
+
+    mat = integer_counts_csr(60_000, 2_000, density=0.05)
+    v = VCSCArray.from_scipy(mat)
+    csc = sp.csc_array(mat)
+    x = np.random.default_rng(0).normal(size=mat.shape[1])
+    return {"time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ x, lambda: csc @ x)}
+
+
+@fast
+def misaligned_matmat_vs_scipy() -> dict[str, float]:
+    """``VCSC @ B``, width 8 -- the case where the accumulator is widest."""
+    import scipy.sparse as sp
+
+    from vsparse import VCSCArray
+
+    mat = integer_counts_csr(60_000, 2_000, density=0.05)
+    v = VCSCArray.from_scipy(mat)
+    csc = sp.csc_array(mat)
+    B = np.random.default_rng(0).normal(size=(mat.shape[1], 8))
+    return {
+        "time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ B, lambda: csc @ B),
+        "peak_alloc_mb": peak_alloc_mb(lambda: v @ B),
+    }
+
+
+@fast
+def misaligned_rmatmat_vs_scipy() -> dict[str, float]:
+    """``B @ VCSR``: same scatter, reached from the other side."""
+    import scipy.sparse as sp
+
+    from vsparse import VCSRArray
+
+    mat = integer_counts_csr(60_000, 2_000, density=0.05)
+    v = VCSRArray.from_scipy(mat)
+    csr = sp.csr_array(mat)
+    B = np.random.default_rng(0).normal(size=(8, mat.shape[0]))
+    return {
+        "time_ratio_vs_scipy": ratio_vs_scipy(lambda: B @ v, lambda: B @ csr),
+        "peak_alloc_mb": peak_alloc_mb(lambda: B @ v),
+    }
+
+
 # -- larger, for the scheduled job -------------------------------------------
 
 

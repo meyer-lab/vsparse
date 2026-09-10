@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numba
 import numpy as np
 
@@ -30,6 +32,36 @@ def accumulator_threads(n_minor: int, bytes_per_element: int = 8) -> int:
         return 1
     affordable = max(1, _ACCUMULATOR_BUDGET_BYTES // (n_minor * max(1, bytes_per_element)))
     return int(min(numba.get_num_threads(), affordable))
+
+
+#: The scatter accumulators below want a much tighter cap than
+#: `_ACCUMULATOR_BUDGET_BYTES`. A reduction's cost scales with the partials, and
+#: measured on a 6M-nonzero 60k x 2k array, letting the 64 MiB budget pick 48
+#: threads for a width-8 product made it *slower* than the serial kernel
+#: (56.6 ms vs 23.3 ms); 4 threads and 15 MB ran it in 11.6 ms.
+_SCATTER_ACCUMULATOR_BUDGET_BYTES = 16 << 20  # 16 MiB
+
+
+def scatter_threads(nnz: int, n_minor: int, width: int = 1) -> int:
+    """Threads for a major-axis scatter, balancing the scatter against the reduction.
+
+    Two costs pull against each other: the scatter itself is ``nnz * width``
+    work split across threads, while reducing the partials afterwards is
+    ``nthreads * n_minor * width``. Setting the derivative of their sum to zero
+    puts the optimum at ``sqrt(nnz / n_minor)`` -- 10 threads for the array
+    above, against a measured best of 16/8/4 for widths 1/4/8.
+
+    The width-dependence the model misses is memory bandwidth on the
+    accumulator, which the byte cap covers: it admits fewer threads exactly as
+    ``width`` grows. Taking the smaller of the two tracks the measured optimum
+    across widths.
+    """
+    if n_minor <= 0 or nnz <= 0:
+        return 1
+    width = max(1, width)
+    affordable = _SCATTER_ACCUMULATOR_BUDGET_BYTES // (n_minor * width * 8)
+    balanced = math.isqrt(max(1, nnz // n_minor))
+    return int(max(1, min(numba.get_num_threads(), affordable, balanced)))
 
 
 @numba.njit(cache=True)
@@ -167,10 +199,79 @@ def minor_counts(value_ptr, indices, n_minor, nthreads):
     return partial.sum(axis=0)
 
 
+# -- misaligned direction, parallelized over thread-local accumulators -------
+#
+# The serial kernels above walk the major axis and scatter into the output, so
+# they cannot be parallelized over that axis directly: two major slices can
+# collide on the same output index.
+#
+# Regrouping a chunk into the opposite format and running an aligned kernel --
+# what `_vcs_matmul` does for the normalized view -- does not pay here. That
+# path caches its transposed copy and amortizes it over an iterative
+# algorithm's many products; a bare `A @ B` pays the regroup once per call, and
+# measured, it turns an 8.7 ms product into 700 ms.
+#
+# So: thread-local accumulators, the same shape `minor_sums`/`minor_extrema`
+# already use, sized by `accumulator_threads` so the partials stay inside the
+# same fixed budget rather than growing with the thread count.
+
+
+@numba.njit(cache=True, parallel=True)
+def _major_matvec_par(major_ptr, values, value_ptr, indices, x, n_major, n_minor, nthreads):
+    partial = np.zeros((nthreads, n_minor), dtype=np.float64)
+    span = (n_major + nthreads - 1) // nthreads
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * span
+        end = min(n_major, start + span)
+        local = partial[t]
+        for j in range(start, end):
+            xj = x[j]
+            if xj == 0.0:
+                continue
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                val = values[u] * xj
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    local[indices[k]] += val
+    return partial.sum(axis=0)
+
+
+@numba.njit(cache=True, parallel=True)
+def _major_matmat_par(major_ptr, values, value_ptr, indices, b, n_major, n_minor, nthreads):
+    width = b.shape[1]
+    partial = np.zeros((nthreads, n_minor, width), dtype=np.float64)
+    span = (n_major + nthreads - 1) // nthreads
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * span
+        end = min(n_major, start + span)
+        local = partial[t]
+        for j in range(start, end):
+            brow = b[j]
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                val = values[u]
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    acc = local[indices[k]]
+                    for c in range(width):
+                        acc[c] += val * brow[c]
+    return partial.sum(axis=0)
 
 
 def major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor):
-    return _major_matvec(major_ptr, values, value_ptr, indices, np.asarray(x), n_major, n_minor)
+    x = np.asarray(x)
+    nthreads = scatter_threads(int(value_ptr[-1]) if value_ptr.shape[0] else 0, n_minor)
+    if nthreads <= 1:
+        # One thread's worth of accumulator is the serial kernel with an extra
+        # allocation and a reduction pass, so skip both.
+        return _major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor)
+    return _major_matvec_par(
+        major_ptr,
+        values,
+        value_ptr,
+        indices,
+        np.ascontiguousarray(x, dtype=np.float64),
+        n_major,
+        n_minor,
+        nthreads,
+    )
 
 
 def minor_matvec(major_ptr, values, value_ptr, indices, x, n_major):
@@ -179,7 +280,20 @@ def minor_matvec(major_ptr, values, value_ptr, indices, x, n_major):
 
 def major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor):
     b = np.ascontiguousarray(b)
-    return _major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor)
+    width = b.shape[1] if b.ndim == 2 else 1
+    nthreads = scatter_threads(int(value_ptr[-1]) if value_ptr.shape[0] else 0, n_minor, width)
+    if nthreads <= 1:
+        return _major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor)
+    return _major_matmat_par(
+        major_ptr,
+        values,
+        value_ptr,
+        indices,
+        np.ascontiguousarray(b, dtype=np.float64),
+        n_major,
+        n_minor,
+        nthreads,
+    )
 
 
 def minor_matmat(major_ptr, values, value_ptr, indices, b, n_major):
@@ -223,7 +337,9 @@ def minor_select_counts(value_ptr, indices, fanout):
     return counts
 
 
-def minor_select_fill(value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices):
+def minor_select_fill(
+    value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
+):
     """Write the remapped minor indices for the surviving slots, in place."""
     _minor_select_fill(
         value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
