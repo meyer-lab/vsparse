@@ -9,6 +9,7 @@ import scipy.sparse as sp
 
 from vsparse import (
     RECIPES,
+    Recipe,
     VCSCAnnData,
     VCSCArray,
     VCSCArrayNormalized,
@@ -252,3 +253,69 @@ def test_anndata_normalized_requires_x():
     adata = VCSCAnnData(obs=pd.DataFrame(index=["a"]), var=pd.DataFrame(index=["g"]))
     with pytest.raises(ValueError, match="requires X"):
         adata.normalized()
+
+
+# -- caller-built Recipe objects ----------------------------------------------
+
+
+def _custom_recipe() -> Recipe:
+    """A recipe that is *not* in RECIPES: cp10k + log1p, centered and variance-scaled."""
+    return Recipe("custom_cp10k_scaled", 1e4, False, RECIPES["scanpy"].g_code, True, True)
+
+
+def test_custom_recipe_works_on_the_array(vcls, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized(_custom_recipe())
+    assert nv.recipe.name == "custom_cp10k_scaled"
+    # Same (a, b, g, c, s) as "scanpy", so it must agree with that reference.
+    np.testing.assert_allclose(nv.toarray(), _reference(dense, "scanpy"), atol=1e-6)
+
+
+def test_custom_recipe_works_on_the_anndata():
+    """Regression: VCSCAnnData.normalized() used to hand ``recipe.name`` back to
+    the array, which re-resolved it through RECIPES and raised for anything the
+    caller built themselves."""
+    rng = np.random.default_rng(0)
+    adata = _small_adata(rng)
+    recipe = _custom_recipe()
+    nv = adata.normalized(recipe)
+
+    assert nv.recipe is recipe
+    assert adata.uns["vsparse"]["recipe"] == "custom_cp10k_scaled"
+    np.testing.assert_allclose(adata.obs["vsparse_a"].to_numpy(), nv.a)
+    np.testing.assert_allclose(
+        nv.toarray(), _reference(np.asarray(adata.X.toarray()), "scanpy"), atol=1e-6
+    )
+
+
+def test_custom_recipe_round_trips_through_recalculate_false():
+    rng = np.random.default_rng(0)
+    adata = _small_adata(rng)
+    recipe = _custom_recipe()
+    ref = adata.normalized(recipe).toarray()
+    adata._vcs_norm_cache.clear()  # force the obs/varm/uns path, not the in-memory one
+    again = adata.normalized(recipe, recalculate=False)
+    np.testing.assert_allclose(again.toarray(), ref)
+
+
+def test_two_custom_recipes_sharing_a_name_do_not_collide(vcls, dense):
+    """The cache keys on the Recipe itself, so a shared ``name`` is not a shared slot."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    centered = Recipe("dup", 1e4, False, RECIPES["scanpy"].g_code, True, False)
+    plain = Recipe("dup", 1e4, False, RECIPES["scanpy"].g_code, False, False)
+    nv_centered = v.normalized(centered)
+    nv_plain = v.normalized(plain, recalculate=False)
+    assert nv_plain is not nv_centered
+    np.testing.assert_allclose(nv_plain.c, 0.0)
+    assert v.normalized(centered, recalculate=False) is nv_centered
+
+
+def test_recipe_with_an_unknown_g_code_is_rejected(vcls, dense):
+    """``_g`` falls through to the identity for an unrecognized code -- fail loudly instead."""
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    with pytest.raises(ValueError, match="unknown g_code"):
+        v.normalized(Recipe("bogus", None, False, 99, False, False))

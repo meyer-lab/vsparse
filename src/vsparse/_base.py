@@ -22,6 +22,7 @@ from vsparse._indexutils import is_full_slice as _is_full_slice
 from vsparse._indexutils import normalize_major_idx as _normalize_major_idx
 from vsparse._indexutils import smallest_index_dtype as _smallest_index_dtype
 from vsparse._norm_common import DEFAULT_RECIPE as _DEFAULT_RECIPE
+from vsparse._norm_common import Recipe as _Recipe
 
 __all__ = ["VCSCArray", "VCSRArray"]
 
@@ -78,7 +79,7 @@ class _VCSBase:
         self.values = values
         self.value_ptr = value_ptr
         self.indices = indices
-        self._norm_cache: dict[str, Any] = {}
+        self._norm_cache: dict[Any, Any] = {}
 
     # -- axis bookkeeping ------------------------------------------------
 
@@ -199,15 +200,16 @@ class _VCSBase:
         )
         return other_cls(self.shape, major_ptr, values, value_ptr, indices)
 
-    def normalized(self, view: str = _DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
+    def normalized(self, view: str | _Recipe = _DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
         """A normalized *view* of this array -- see :mod:`vsparse._vcs_norm`/:mod:`vsparse._norm_common`.
 
         Parameters
         ----------
         view
-            Which normalization recipe to apply -- one of
+            Which normalization recipe to apply: the name of one of
             :data:`vsparse._norm_common.RECIPES` (``"raw"``, ``"cp10k_log1p"``,
-            ``"parafac2"`` (the default), ``"scanpy"``, ``"pearson"``).
+            ``"parafac2"`` (the default), ``"scanpy"``, ``"pearson"``), or a
+            :class:`~vsparse._norm_common.Recipe` built by the caller.
         recalculate
             If ``True`` (the default), (re)compute the recipe's statistics
             fresh from this array. If ``False``, reuse a previously computed
@@ -223,13 +225,13 @@ class _VCSBase:
         recipe = resolve_recipe(view)
         cache = self._norm_cache
         if not recalculate:
-            cached = cache.get(recipe.name)
+            cached = cache.get(recipe)
             if cached is not None:
                 return cached
 
         cls = VCSCArrayNormalized if self._format == "csc" else VCSRArrayNormalized
         result = cls(self, recipe)
-        cache[recipe.name] = result
+        cache[recipe] = result
         return result
 
     def log1p(self) -> _VCSBase:
