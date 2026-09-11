@@ -167,21 +167,32 @@ def minor_counts(value_ptr, indices, n_minor, nthreads):
     return partial.sum(axis=0)
 
 
+def _promote(values, other):
+    """Widen ``values``/``other`` to their common dtype so accumulation doesn't
+    silently wrap modulo a narrow stored dtype (e.g. ``uint16`` counts), matching
+    the dtype promotion ordinary ``numpy`` arrays would get for the same product.
+    """
+    out_dtype = np.result_type(values.dtype, other.dtype)
+    return values.astype(out_dtype, copy=False), other.astype(out_dtype, copy=False)
+
+
 def major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor):
-    return _major_matvec(major_ptr, values, value_ptr, indices, np.asarray(x), n_major, n_minor)
+    values, x = _promote(values, np.asarray(x))
+    return _major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor)
 
 
 def minor_matvec(major_ptr, values, value_ptr, indices, x, n_major):
-    return _minor_matvec(major_ptr, values, value_ptr, indices, np.asarray(x), n_major)
+    values, x = _promote(values, np.asarray(x))
+    return _minor_matvec(major_ptr, values, value_ptr, indices, x, n_major)
 
 
 def major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor):
-    b = np.ascontiguousarray(b)
+    values, b = _promote(values, np.ascontiguousarray(b))
     return _major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor)
 
 
 def minor_matmat(major_ptr, values, value_ptr, indices, b, n_major):
-    b = np.ascontiguousarray(b)
+    values, b = _promote(values, np.ascontiguousarray(b))
     return _minor_matmat(major_ptr, values, value_ptr, indices, b, n_major)
 
 

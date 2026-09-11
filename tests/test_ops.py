@@ -135,3 +135,32 @@ def test_unsupported_matmul_operands_raise(dense, vcls):
     with pytest.raises(TypeError):
         _ = arr_3d @ v
 
+
+def test_matmul_does_not_overflow_narrow_value_dtype(vcls):
+    """Regression test for #43: matvec/matmat must not wrap modulo a narrow
+    stored dtype (e.g. uint16 counts) the way ``values.dtype``-sized
+    accumulators used to. ``sum()`` already got this right; the products
+    should agree with it instead of silently wrapping.
+    """
+    n_rows, n_cols = 2000, 5
+    dense = np.full((n_rows, n_cols), 40, dtype=np.uint16)  # col totals = 80000 > uint16 max
+    v = _make(vcls, dense)
+    assert v.dtype == np.uint16
+
+    ones_rows = np.ones(n_rows, dtype=np.float64)
+    expected_cols = np.ravel(v.sum(axis=0))
+    np.testing.assert_array_equal(ones_rows @ v, expected_cols)
+
+    ones_mat = np.ones((3, n_rows), dtype=np.float64)
+    np.testing.assert_array_equal(ones_mat @ v, np.tile(expected_cols, (3, 1)))
+
+    dense2 = np.zeros((3, 2000), dtype=np.uint16)
+    dense2[0, :] = 40  # row 0 total = 80000 > uint16 max
+    v2 = _make(vcls, dense2)
+    ones_cols = np.ones(2000, dtype=np.float64)
+    expected_rows = np.ravel(v2.sum(axis=1))
+    np.testing.assert_array_equal(v2 @ ones_cols, expected_rows)
+
+    ones_mat2 = np.ones((2000, 3), dtype=np.float64)
+    np.testing.assert_array_equal(v2 @ ones_mat2, np.tile(expected_rows, (3, 1)).T)
+
