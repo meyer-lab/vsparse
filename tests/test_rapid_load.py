@@ -136,9 +136,7 @@ def test_min_cells_uses_obs_filtered_cohort(tmp_path):
         min_cells=2,
         obs_filter=lambda obs: obs["condition"] == "control",
     )
-    ref_X, _, ref_genes = _reference_prepare(
-        dense[obs_mask], -1.0, 0.0, min_cells=2
-    )
+    ref_X, _, ref_genes = _reference_prepare(dense[obs_mask], -1.0, 0.0, min_cells=2)
 
     assert list(result.var_names) == [str(i) for i in ref_genes]
     assert list(result.var_names) == ["1", "2"]
@@ -340,11 +338,18 @@ def test_metadata_sliced_correctly(tmp_path, rng):
 
     # Check obsm/varm
     np.testing.assert_allclose(np.asarray(result.obsm["pca"]), np.asarray(obsm["pca"])[ref_cells])
-    np.testing.assert_allclose(np.asarray(result.varm["loadings"]), np.asarray(varm["loadings"])[ref_genes])
+    np.testing.assert_allclose(
+        np.asarray(result.varm["loadings"]), np.asarray(varm["loadings"])[ref_genes]
+    )
 
     # Check obsp/varp
-    np.testing.assert_allclose(np.asarray(result.obsp["distances"]), np.asarray(obsp["distances"])[ref_cells][:, ref_cells])
-    np.testing.assert_allclose(np.asarray(result.varp["correlations"]), np.asarray(varp["correlations"])[ref_genes][:, ref_genes])
+    np.testing.assert_allclose(
+        np.asarray(result.obsp["distances"]), np.asarray(obsp["distances"])[ref_cells][:, ref_cells]
+    )
+    np.testing.assert_allclose(
+        np.asarray(result.varp["correlations"]),
+        np.asarray(varp["correlations"])[ref_genes][:, ref_genes],
+    )
 
     # Check uns
     assert result.uns == uns
@@ -388,7 +393,9 @@ def test_rapid_load_custom_x_key(tmp_path, rng):
     with h5py.File(path, "w") as f:
         _io.write_ivcs_elem(f, "custom_matrix", vcsr)
 
-    result = load_and_normalize(path, x_key="custom_matrix", min_cell_counts=-1.0, gene_threshold=0.0)
+    result = load_and_normalize(
+        path, x_key="custom_matrix", min_cell_counts=-1.0, gene_threshold=0.0
+    )
     assert isinstance(result, ad.AnnData)
     assert result.shape == dense.shape
 
@@ -422,4 +429,3 @@ def test_load_packed_metadata_preserved(tmp_path, rng):
     pd.testing.assert_index_equal(result.obs.index, adata.obs.index)
     assert list(result.obs["grp"]) == list(adata.obs["grp"])
     assert list(result.var["gene"]) == list(adata.var["gene"])
-

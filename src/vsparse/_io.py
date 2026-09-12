@@ -117,7 +117,7 @@ def _make_read_ivcs(cls: type[_VCSBase]):
         values = cast(np.ndarray, _reader.read_elem(elem["values"]))
         value_ptr = cast(np.ndarray, _reader.read_elem(elem["value_ptr"]))
         packed = cast(np.ndarray, _reader.read_elem(elem["packed_indices"]))
-        dtype = np.dtype(elem.attrs["indices_dtype"])
+        dtype = np.dtype(cast(str, elem.attrs["indices_dtype"]))
         indices = _ivcsc.unpack_indices(value_ptr, packed, dtype)
         return cls(shape, major_ptr, values, value_ptr, indices)
 

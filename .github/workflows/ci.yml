@@ -30,6 +30,12 @@ jobs:
       - name: Lint with Ruff
         run: uv run ruff check .
 
+      - name: Check formatting with Ruff
+        run: uv run ruff format --check .
+
+      - name: Check spelling with codespell
+        run: uv run codespell
+
       - name: Type check with ty
         run: uv run ty check
 

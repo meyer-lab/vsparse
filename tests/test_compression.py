@@ -24,9 +24,11 @@ def test_zarr_dataset_kwargs_options():
 
 def test_numeric_only_compression_invalid_backend():
     """Verify that numeric_only_compression raises ValueError for an unsupported format."""
-    with pytest.raises(ValueError, match="store_kind must be 'h5' or 'zarr'"):
-        with _compression.numeric_only_compression("invalid_format"):
-            pass
+    with (
+        pytest.raises(ValueError, match="store_kind must be 'h5' or 'zarr'"),
+        _compression.numeric_only_compression("invalid_format"),
+    ):
+        pass
 
 
 def test_is_string_like_detection():

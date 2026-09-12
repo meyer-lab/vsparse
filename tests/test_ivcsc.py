@@ -50,7 +50,9 @@ def test_unpack_parallel_matches_serial():
     v = VCSCArray.from_scipy(sp.csc_array(dense))
 
     packed = _ivcsc.pack_indices(v.value_ptr, v.indices)
-    assert packed.nbytes > _ivcsc._PARALLEL_MIN_BYTES, "test data too small to hit the parallel path"
+    assert packed.nbytes > _ivcsc._PARALLEL_MIN_BYTES, (
+        "test data too small to hit the parallel path"
+    )
 
     out = np.empty(v.indices.shape[0], dtype=v.indices.dtype)
     _ivcsc._unpack(v.value_ptr, packed, out)
