@@ -1,3 +1,9 @@
+"""Error-path and regression tests for scalar/matmul ops on VCSCArray/VCSRArray.
+
+Numeric correctness against a dense reference (scalar mul/div, neg, transpose,
+log1p, matvec/matmat) is covered by property-based tests in test_property_ops.py.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -16,83 +22,11 @@ def _make(vcls, dense):
     return vcls.from_scipy(sp.csr_array(dense))
 
 
-def test_scalar_mul(dense, vcls):
-    v = _make(vcls, dense)
-    for scalar in (2.0, -1.5, 0.0):
-        out = v * scalar
-        np.testing.assert_allclose(out.to_scipy().toarray(), dense * scalar)
-        out2 = scalar * v
-        np.testing.assert_allclose(out2.to_scipy().toarray(), dense * scalar)
-
-
-def test_scalar_div(dense, vcls):
-    v = _make(vcls, dense)
-    out = v / 2.0
-    np.testing.assert_allclose(out.to_scipy().toarray(), dense / 2.0)
-
-
-def test_neg(dense, vcls):
-    v = _make(vcls, dense)
-    np.testing.assert_allclose((-v).to_scipy().toarray(), -dense)
-
-
-def test_transpose(dense, vcls):
-    v = _make(vcls, dense)
-    vt = v.T
-    np.testing.assert_allclose(vt.to_scipy().toarray(), dense.T)
-    assert vt.shape == dense.T.shape
-    vtt = vt.T
-    assert type(vtt) is type(v)
-    np.testing.assert_allclose(vtt.to_scipy().toarray(), dense)
-
-
-def test_log1p(dense, vcls):
-    v = _make(vcls, dense)
-    out = v.log1p()
-    np.testing.assert_allclose(out.to_scipy().toarray(), np.log1p(dense))
-
-
-def test_matvec_right(dense, vcls, rng):
-    v = _make(vcls, dense)
-    x = rng.random(dense.shape[1])
-    np.testing.assert_allclose(v @ x, dense @ x, atol=1e-8)
-
-
-def test_matvec_left(dense, vcls, rng):
-    v = _make(vcls, dense)
-    x = rng.random(dense.shape[0])
-    np.testing.assert_allclose(x @ v, x @ dense, atol=1e-8)
-
-
-def test_matmat_right(dense, vcls, rng):
-    v = _make(vcls, dense)
-    b = rng.random((dense.shape[1], 3))
-    np.testing.assert_allclose(v @ b, dense @ b, atol=1e-8)
-
-
-def test_matmat_left(dense, vcls, rng):
-    v = _make(vcls, dense)
-    b = rng.random((3, dense.shape[0]))
-    np.testing.assert_allclose(b @ v, b @ dense, atol=1e-8)
-
-
 def test_matvec_dimension_mismatch_raises(dense, vcls):
     """Verify that dimension mismatch in matrix-vector product raises ValueError."""
     v = _make(vcls, dense)
     with pytest.raises(ValueError, match="not aligned"):
         v @ np.ones(dense.shape[1] + 1)
-
-
-def test_scalar_mul_zero_returns_empty_like(dense, vcls):
-    """Verify that multiplying by 0 produces an empty-like array preserving shape and dtype."""
-    v = _make(vcls, dense)
-    v0 = v * 0
-    assert isinstance(v0, vcls)
-    assert v0.shape == v.shape
-    assert v0.dtype == v.dtype
-    assert v0.nnz == 0
-    assert v0.n_unique == 0
-    np.testing.assert_allclose(v0.toarray(), np.zeros(v.shape))
 
 
 def test_unsupported_scalar_operands_raise(dense, vcls):
@@ -163,4 +97,3 @@ def test_matmul_does_not_overflow_narrow_value_dtype(vcls):
 
     ones_mat2 = np.ones((2000, 3), dtype=np.float64)
     np.testing.assert_array_equal(v2 @ ones_mat2, np.tile(expected_rows, (3, 1)).T)
-

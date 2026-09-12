@@ -1,3 +1,10 @@
+"""Tests for select() vs __getitem__() on normalized views, using a designed
+two-population dataset (differing depth and marker genes) where the two
+diverge substantially -- not a property that holds for arbitrary small random
+matrices. General select()-matches-reference and select()-with-no-args
+properties are covered in test_property_normalization.py instead.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -93,29 +100,6 @@ def test_select_returns_a_view_that_still_composes(vcls):
     rng = np.random.default_rng(3)
     B = rng.normal(size=(dense.shape[1], 4))
     np.testing.assert_allclose(sub @ B, _reference(dense[mask]) @ B, atol=1e-8)
-
-
-def test_select_columns_and_both_axes(vcls):
-    """Two index arrays select a sub-block, not a pointwise diagonal."""
-    dense, _ = _mixed_population()
-    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
-    rows = np.arange(0, dense.shape[0], 7)
-    cols = np.arange(0, dense.shape[1], 5)
-    assert rows.shape != cols.shape
-
-    np.testing.assert_allclose(
-        nv.select(cols=cols).toarray(), _reference(dense[:, cols]), atol=1e-10
-    )
-    np.testing.assert_allclose(
-        nv.select(rows, cols).toarray(), _reference(dense[np.ix_(rows, cols)]), atol=1e-10
-    )
-
-
-def test_select_everything_is_the_whole_view(vcls, dense):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
-    np.testing.assert_allclose(nv.select().toarray(), nv.toarray(), atol=1e-12)
 
 
 # -- __getitem__: a window that keeps the parent's statistics ----------------

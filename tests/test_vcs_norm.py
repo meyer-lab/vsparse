@@ -1,4 +1,8 @@
-"""Tests for VCSCArrayNormalized/VCSRArrayNormalized: normalized VCSC/VCSR views."""
+"""Tests for VCSCArrayNormalized/VCSRArrayNormalized: normalized VCSC/VCSR views.
+
+Numeric correctness of the default view against a dense reference (toarray,
+matmul) is covered by property-based tests in test_property_normalization.py.
+"""
 
 from __future__ import annotations
 
@@ -33,15 +37,6 @@ def _reference(dense: np.ndarray) -> np.ndarray:
         normalized = np.where(gene_scale > 0, scaled / gene_scale[None, :], 0.0)
     transformed = np.log10(1.0 + 1000.0 * normalized)
     return transformed - transformed.mean(axis=0, keepdims=True)
-
-
-def test_toarray_matches_reference(dense, vcls):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized()
-    assert isinstance(nv, _norm_cls(vcls))
-    np.testing.assert_allclose(nv.toarray(), _reference(dense), atol=1e-8)
 
 
 def test_getitem_matches_reference_block(dense, vcls):
@@ -107,55 +102,7 @@ def test_unsupported_operations_raise_runtime_error(dense, vcls, op):
         op(nv)
 
 
-# -- matmul: nv @ B / B @ nv, against a dense reference ----------------------
-
-
-def test_matmul_matches_reference(dense, vcls):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized()
-    ref = _reference(dense)
-
-    rng = np.random.default_rng(7)
-    B = rng.normal(size=(dense.shape[1], 3))
-    np.testing.assert_allclose(nv @ B, ref @ B, atol=1e-7)
-
-
-def test_matvec_matches_reference(dense, vcls):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized()
-    ref = _reference(dense)
-
-    rng = np.random.default_rng(8)
-    b = rng.normal(size=dense.shape[1])
-    np.testing.assert_allclose(nv @ b, ref @ b, atol=1e-7)
-
-
-def test_rmatmul_matches_reference(dense, vcls):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized()
-    ref = _reference(dense)
-
-    rng = np.random.default_rng(9)
-    B = rng.normal(size=(3, dense.shape[0]))
-    np.testing.assert_allclose(B @ nv, B @ ref, atol=1e-7)
-
-
-def test_rmatvec_matches_reference(dense, vcls):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized()
-    ref = _reference(dense)
-
-    rng = np.random.default_rng(10)
-    b = rng.normal(size=dense.shape[0])
-    np.testing.assert_allclose(b @ nv, b @ ref, atol=1e-7)
+# -- matmul: error paths (numeric correctness is property-tested) ------------
 
 
 def test_matmul_bad_shape_raises(dense, vcls):

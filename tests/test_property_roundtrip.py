@@ -1,5 +1,4 @@
-"""Prototype: property-based tests via Hypothesis, alongside the existing
-seeded-rng fixtures in conftest.py.
+"""Property-based tests via Hypothesis for VCSC/VCSR construction and round-trip.
 
 These cover the same kind of ground as the manual `rng.integers(...)` fuzzing
 used elsewhere (e.g. test_chunked_transpose.py), but let Hypothesis choose
@@ -12,33 +11,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import scipy.sparse as sp
-from hypothesis import HealthCheck, given, settings
+from _hypothesis_strategies import dense_matrices, slow_first_call
+from hypothesis import given
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
 
 from vsparse import VCSCArray, VCSRArray
-
-# The underlying compress/decompress/matmul kernels are @numba.njit(cache=True);
-# the first call in a process pays JIT compilation cost that has nothing to do
-# with the example being tested, so give Hypothesis room instead of tripping
-# its default deadline/"too slow" health check.
-_slow_first_call = settings(deadline=None, suppress_health_check=[HealthCheck.too_slow])
-
-_MAX_SIDE = 25
-
-
-@st.composite
-def dense_matrices(draw, *, max_side: int = _MAX_SIDE) -> np.ndarray:
-    """A dense float64 matrix with plenty of structural zeros, of a shrinkable
-    shape (including empty axes)."""
-    shape = (
-        draw(st.integers(0, max_side)),
-        draw(st.integers(0, max_side)),
-    )
-    values = draw(arrays(dtype=np.float64, shape=shape, elements=st.integers(0, 4).map(float)))
-    zero_mask = draw(arrays(dtype=bool, shape=shape, elements=st.booleans()))
-    values[zero_mask] = 0.0
-    return values
 
 
 def _scipy_for(vcls, dense: np.ndarray):
@@ -46,7 +24,7 @@ def _scipy_for(vcls, dense: np.ndarray):
 
 
 @pytest.mark.parametrize("vcls", [VCSCArray, VCSRArray])
-@_slow_first_call
+@slow_first_call
 @given(dense=dense_matrices())
 def test_from_scipy_toarray_roundtrips(vcls, dense):
     """Compressing and decompressing must reproduce the original matrix exactly,
@@ -56,10 +34,15 @@ def test_from_scipy_toarray_roundtrips(vcls, dense):
     np.testing.assert_array_equal(v.toarray(), dense)
     assert v.shape == dense.shape
     assert v.nnz == int(np.count_nonzero(dense))
+    np.testing.assert_array_equal(v.to_scipy().toarray(), dense)
+    other = VCSRArray if vcls is VCSCArray else VCSCArray
+    np.testing.assert_array_equal(
+        (v.to_csr() if other is VCSCArray else v.to_csc()).toarray(), dense
+    )
 
 
 @pytest.mark.parametrize("vcls", [VCSCArray, VCSRArray])
-@_slow_first_call
+@slow_first_call
 @given(dense=dense_matrices(), data=st.data())
 def test_matmul_matches_dense_reference(vcls, dense, data):
     """v @ B must agree with the dense reference for any compatible B, at any
@@ -70,3 +53,13 @@ def test_matmul_matches_dense_reference(vcls, dense, data):
 
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     np.testing.assert_allclose(v @ b, dense @ b, atol=1e-8)
+
+
+def test_value_compression_deduplicates():
+    """Repeated values within a major slice collapse to one stored entry."""
+    dense = np.zeros((10, 10))
+    dense[:, 0] = 3.0  # ten repeats of the same value in one column
+    dense[0, 1] = 7.0
+    v = VCSCArray.from_scipy(sp.csc_array(dense))
+    assert v.nnz == 11
+    assert v.n_unique == 2  # one unique value per nonempty column

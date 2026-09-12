@@ -1,4 +1,8 @@
-"""Tests for normalization recipes (issue #40): multiple views, caching, and staleness."""
+"""Tests for normalization recipes (issue #40): multiple views, caching, and staleness.
+
+Per-recipe numeric correctness against a dense reference is covered by
+property-based tests in test_property_normalization.py.
+"""
 
 from __future__ import annotations
 
@@ -10,15 +14,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from vsparse import (
-    RECIPES,
-    Recipe,
-    VCSCAnnData,
-    VCSCArray,
-    VCSCArrayNormalized,
-    VCSRArray,
-    VCSRArrayNormalized,
-)
+from vsparse import RECIPES, Recipe, VCSCAnnData, VCSCArray, VCSRArray
 from vsparse._norm_common import NORM_CACHE_MAXSIZE
 
 
@@ -29,10 +25,6 @@ def vcls(request):
 
 def _scipy_for(vcls, dense):
     return sp.csc_array(dense) if vcls is VCSCArray else sp.csr_array(dense)
-
-
-def _norm_cls(vcls):
-    return VCSCArrayNormalized if vcls is VCSCArray else VCSRArrayNormalized
 
 
 def _reference(dense: np.ndarray, recipe: str) -> np.ndarray:
@@ -85,33 +77,9 @@ def _reference(dense: np.ndarray, recipe: str) -> np.ndarray:
 
 
 # -- per-recipe numerical correctness -----------------------------------------
-
-
-@pytest.mark.parametrize("recipe", sorted(RECIPES))
-def test_toarray_matches_reference_for_every_recipe(dense, vcls, recipe):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized(recipe)
-    assert isinstance(nv, _norm_cls(vcls))
-    assert nv.recipe.name == recipe
-    np.testing.assert_allclose(nv.toarray(), _reference(dense, recipe), atol=1e-6)
-
-
-@pytest.mark.parametrize("recipe", sorted(RECIPES))
-def test_matmul_matches_reference_for_every_recipe(dense, vcls, recipe):
-    if dense.sum() == 0:
-        pytest.skip("all-zero matrix: median row total is 0")
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    nv = v.normalized(recipe)
-    ref = _reference(dense, recipe)
-
-    rng = np.random.default_rng(11)
-    B = rng.normal(size=(dense.shape[1], 3))
-    np.testing.assert_allclose(nv @ B, ref @ B, atol=1e-5)
-
-    Bl = rng.normal(size=(3, dense.shape[0]))
-    np.testing.assert_allclose(Bl @ nv, Bl @ ref, atol=1e-5)
+#
+# Covered by property-based tests in test_property_normalization.py
+# (test_recipe_matches_reference), across arbitrary shapes/densities.
 
 
 def test_unknown_view_raises(vcls, dense):

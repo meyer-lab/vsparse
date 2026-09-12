@@ -1,3 +1,10 @@
+"""Regression and memory tests for duplicate-minor-index selection.
+
+General duplicate-index fanout, matched against a dense/scipy reference across
+arbitrary shapes and index lists, is covered by property-based tests in
+test_property_indexing.py.
+"""
+
 from __future__ import annotations
 
 import tracemalloc
@@ -53,19 +60,6 @@ def test_duplicates_on_both_axes_at_once(vcls):
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     rows, cols = [0, 0, 2], [1, 1, 4]
     np.testing.assert_allclose(v[rows, cols].toarray(), dense[np.ix_(rows, cols)])
-
-
-def test_matches_scipy_for_a_random_selection_with_repeats(vcls, rng):
-    """Against scipy, which fans duplicate indices out correctly."""
-    dense = rng.integers(0, 4, size=(12, 9)).astype(np.float64)
-    v = vcls.from_scipy(_scipy_for(vcls, dense))
-    reference = _scipy_for(vcls, dense)
-
-    for _ in range(25):
-        cols = rng.integers(0, dense.shape[1], size=rng.integers(1, 15)).tolist()
-        np.testing.assert_allclose(
-            v[:, cols].toarray(), np.asarray(reference[:, cols].todense())
-        )
 
 
 # -- selections that already worked, kept working ----------------------------
