@@ -59,31 +59,31 @@ v = vsparse.VCSCArray.from_scipy(csc)
 
 # Or build from an AnnData object or SciPy sparse array
 adata = ...  # an AnnData object
-v = vsparse.from_anndata(adata)                   # VCSCArray (column-compressed) from adata.X
-vr = vsparse.from_anndata(adata, format="csr")    # VCSRArray (row-compressed)
+v = vsparse.from_anndata(adata)  # VCSCArray (column-compressed) from adata.X
+vr = vsparse.from_anndata(adata, format="csr")  # VCSRArray (row-compressed)
 
 # Transposition is zero-copy (swaps major/minor axes and shares buffers)
-vr = v.T                                       # VCSRArray
+vr = v.T  # VCSRArray
 
 # Scalar arithmetic & math
-v2 = v * 2.0                                   # Scalar multiplication
-v_div = v / 2.0                                # Scalar division
-v_neg = -v                                     # Negation
-v_log = v.log1p()                              # Elementwise log1p
+v2 = v * 2.0  # Scalar multiplication
+v_div = v / 2.0  # Scalar division
+v_neg = -v  # Negation
+v_log = v.log1p()  # Elementwise log1p
 
 # Matrix & vector products (Numba-parallelized)
-y = v @ x                                      # Matrix-vector: (n_rows, n_cols) @ (n_cols,) -> (n_rows,)
-y_left = x @ v                                 # Vector-matrix: (n_rows,) @ (n_rows, n_cols) -> (n_cols,)
-Y = v @ B                                      # Matrix-matrix: (n_rows, n_cols) @ (n_cols, k) -> (n_rows, k)
-Y_left = B @ v                                 # Matrix-matrix: (k, n_rows) @ (n_rows, n_cols) -> (k, n_cols)
+y = v @ x  # Matrix-vector: (n_rows, n_cols) @ (n_cols,) -> (n_rows,)
+y_left = x @ v  # Vector-matrix: (n_rows,) @ (n_rows, n_cols) -> (n_cols,)
+Y = v @ B  # Matrix-matrix: (n_rows, n_cols) @ (n_cols, k) -> (n_rows, k)
+Y_left = B @ v  # Matrix-matrix: (k, n_rows) @ (n_rows, n_cols) -> (k, n_cols)
 
 # Slicing
-col_slice = v[:, [1, 3, 5]]                    # Fast major-axis slicing (returns VCSCArray)
-sub = v[0:10, 0:10]                            # 2D slicing (falls back to scipy)
+col_slice = v[:, [1, 3, 5]]  # Fast major-axis slicing (returns VCSCArray)
+sub = v[0:10, 0:10]  # 2D slicing (falls back to scipy)
 
 # Conversion & layers
-sp_csc = v.to_scipy()                          # -> scipy.sparse.csc_array (or to_csr())
-dense = v.toarray()                            # -> numpy.ndarray
+sp_csc = v.to_scipy()  # -> scipy.sparse.csc_array (or to_csr())
+dense = v.toarray()  # -> numpy.ndarray
 vsparse.to_layer(adata, v, key="counts_vcsc")  # Attach to AnnData layer
 ```
 
@@ -96,15 +96,15 @@ is an `AnnData` subclass whose `X` (and optionally `raw_X`) is backed directly b
 ```python
 import vsparse
 
-va = vsparse.VCSCAnnData.from_anndata(adata)   # Compresses X and raw.X
-va.X                                           # VCSCArray
-va.raw_X                                       # VCSCArray (separate from anndata's .raw)
+va = vsparse.VCSCAnnData.from_anndata(adata)  # Compresses X and raw.X
+va.X  # VCSCArray
+va.raw_X  # VCSCArray (separate from anndata's .raw)
 
 # Persist to HDF5 (.h5ad) or Zarr with default Blosc2+LZ4 compression
-va.write_h5ad("compressed.h5ad")               # Read back with VCSCAnnData.read_h5ad
+va.write_h5ad("compressed.h5ad")  # Read back with VCSCAnnData.read_h5ad
 va2 = vsparse.VCSCAnnData.read_h5ad("compressed.h5ad")
 
-va.write_zarr("compressed.zarr")               # Read back with VCSCAnnData.read_zarr
+va.write_zarr("compressed.zarr")  # Read back with VCSCAnnData.read_zarr
 va3 = vsparse.VCSCAnnData.read_zarr("compressed.zarr")
 
 # Escape hatch back to standard AnnData
@@ -135,8 +135,8 @@ For IVCSR-backed datasets, `vsparse.load_and_normalize` bypasses full array deco
 ```python
 adata_norm = vsparse.load_and_normalize(
     "archived.h5ad",
-    min_cell_counts=10.0,      # Filter cells with counts <= 10
-    gene_threshold=0.05,       # Filter genes with counts <= 0.05 * n_cells
+    min_cell_counts=10.0,  # Filter cells with counts <= 10
+    gene_threshold=0.05,  # Filter genes with counts <= 0.05 * n_cells
 )
 ```
 

@@ -123,4 +123,3 @@ def test_invalid_tuple_indexing_dimensions_raises(dense, vcls):
     v = vcls.from_scipy(sp.csr_array(dense))
     with pytest.raises(IndexError, match="arrays are 2-D"):
         _ = v[0, 0, 0]
-

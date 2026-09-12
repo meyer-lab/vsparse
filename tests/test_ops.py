@@ -163,4 +163,3 @@ def test_matmul_does_not_overflow_narrow_value_dtype(vcls):
 
     ones_mat2 = np.ones((2000, 3), dtype=np.float64)
     np.testing.assert_array_equal(v2 @ ones_mat2, np.tile(expected_rows, (3, 1)).T)
-

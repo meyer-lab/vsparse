@@ -109,4 +109,6 @@ def test_zarr_write_converts_too(tmp_path):
     back = VCSCAnnData.read_zarr(store)
 
     assert isinstance(back.obs["cell_type"].dtype, pd.CategoricalDtype)
-    np.testing.assert_array_equal(back.obs["cell_type"].astype(str), va.obs["cell_type"].astype(str))
+    np.testing.assert_array_equal(
+        back.obs["cell_type"].astype(str), va.obs["cell_type"].astype(str)
+    )

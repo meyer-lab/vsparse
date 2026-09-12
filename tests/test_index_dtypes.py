@@ -27,9 +27,7 @@ def _with_int64_indices(mat):
     return out
 
 
-@pytest.mark.parametrize(
-    ("n", "expected"), [(INT32_MAX, np.int32), (INT32_MAX + 1, np.int64)]
-)
+@pytest.mark.parametrize(("n", "expected"), [(INT32_MAX, np.int32), (INT32_MAX + 1, np.int64)])
 def test_dtype_switches_at_the_int32_boundary(n, expected):
     assert smallest_index_dtype(n) == np.dtype(expected)
 
