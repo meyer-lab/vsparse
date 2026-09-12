@@ -44,6 +44,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "ty>=0.0.1a1",
+    "codespell>=2.3",
 ]
 
 [build-system]
@@ -55,11 +56,15 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "NPY", "RUF"]
+select = ["E", "F", "B", "NPY", "PD", "SIM", "RET", "PIE", "ERA", "PERF", "UP", "C4", "RUF"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["vsparse"]
+
+[tool.codespell]
+skip = "*.lock,uv.lock,.venv,docs/_build,benchmarks/baselines.json"
+ignore-words-list = "coo"
 
 [tool.ty.environment]
 python-version = "3.12"

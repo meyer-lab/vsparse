@@ -188,7 +188,9 @@ def test_uns_embedding_roundtrips_via_registry(base_adata, dense, tmp_path):
 def test_x_setter_validation(base_adata, dense):
     """Verify that assigning a valid X matrix updates the X property and shape mismatch raises ValueError."""
     va = VCSCAnnData.from_anndata(base_adata)
-    mismatched_v = VCSCArray.from_scipy(sp.csc_array(np.zeros((dense.shape[0] + 1, dense.shape[1]))))
+    mismatched_v = VCSCArray.from_scipy(
+        sp.csc_array(np.zeros((dense.shape[0] + 1, dense.shape[1])))
+    )
     with pytest.raises(ValueError, match="does not match adata shape"):
         va.X = mismatched_v
 
@@ -249,4 +251,3 @@ def test_getitem_single_int_row(base_adata, dense):
     assert sub.shape == (1, dense.shape[1])
     assert isinstance(sub.X, VCSCArray)
     np.testing.assert_allclose(sub.X.toarray(), dense[0:1])
-

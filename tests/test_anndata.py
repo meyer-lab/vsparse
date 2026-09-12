@@ -76,4 +76,3 @@ def test_to_layer_shape_mismatch_raises(adata, dense):
     mismatched_adata = ad.AnnData(X=np.zeros((dense.shape[0] + 1, dense.shape[1])))
     with pytest.raises(ValueError, match="shape mismatch"):
         vsparse.to_layer(mismatched_adata, v, key="layer_key")
-
