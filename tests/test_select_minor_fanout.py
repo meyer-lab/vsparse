@@ -1,3 +1,10 @@
+"""Regression and memory tests for duplicate-minor-index selection.
+
+General duplicate-index fanout, matched against a dense/scipy reference across
+arbitrary shapes and index lists, is covered by property-based tests in
+test_property_indexing.py.
+"""
+
 from __future__ import annotations
 
 import tracemalloc
