@@ -78,10 +78,7 @@ def _recipe_reference(dense: np.ndarray, recipe: str) -> np.ndarray:
     else:
         g = x
 
-    if recipe in ("parafac2", "scanpy", "pearson"):
-        c = g.mean(axis=0)
-    else:
-        c = np.zeros(dense.shape[1])
+    c = g.mean(axis=0) if recipe in ("parafac2", "scanpy", "pearson") else np.zeros(dense.shape[1])
 
     if recipe in ("scanpy", "pearson"):
         std = g.std(axis=0)
