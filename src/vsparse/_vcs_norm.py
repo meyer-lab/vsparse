@@ -13,12 +13,9 @@ per-nonzero walk over the already-decoded ``indices`` array).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from vsparse._norm_common import DEFAULT_RECIPE, NormalizedViewBase, Recipe
-
-if TYPE_CHECKING:
-    from vsparse._base import _VCSBase
+from vsparse._norm_common import NormalizedViewBase
 
 __all__ = ["VCSCArrayNormalized", "VCSRArrayNormalized"]
 
@@ -26,20 +23,7 @@ __all__ = ["VCSCArrayNormalized", "VCSRArrayNormalized"]
 class _VCSNormalizedBase(NormalizedViewBase):
     """Shared implementation for :class:`VCSCArrayNormalized`/:class:`VCSRArrayNormalized`."""
 
-    __slots__ = ("_dual_arr",)
-
-    _dual_arr: _VCSBase | None
-
-    def __init__(
-        self, arr: _VCSBase, recipe: str | Recipe = DEFAULT_RECIPE, *, stale: bool = False
-    ) -> None:
-        super().__init__(arr, recipe, stale=stale)
-        self._init_extra()
-
-    def _init_extra(self) -> None:
-        # Opposite-format copy of `arr`, cached by vsparse._vcs_matmul when
-        # regrouping the whole array fits one chunk's budget.
-        self._dual_arr = None
+    __slots__ = ()
 
     def __matmul__(self, other: Any) -> Any:
         """``self @ other`` for a dense ``other`` -- see :mod:`vsparse._vcs_matmul`."""
