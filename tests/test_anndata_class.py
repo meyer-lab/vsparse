@@ -319,3 +319,35 @@ def test_copy_of_a_slice_round_trips_x(base_adata, dense):
     c = sub.copy()
     assert c.X is not None
     np.testing.assert_allclose(c.X.toarray(), dense[0:2, 0:2])
+
+
+# -- to_memory() -- same underlying problem as copy(): the inherited
+# anndata.AnnData.to_memory() doesn't know about _vcs_X/_vcs_raw_X either.
+
+
+def test_to_memory_preserves_x_and_raw_x(base_adata, dense):
+    va = VCSCAnnData.from_anndata(base_adata)
+    m = va.to_memory()
+    assert type(m) is VCSCAnnData
+    assert isinstance(m.X, VCSCArray)
+    assert isinstance(m.raw_X, VCSCArray)
+    np.testing.assert_allclose(m.X.toarray(), dense)
+    np.testing.assert_allclose(m.raw_X.toarray(), dense)
+
+
+def test_to_memory_preserves_a_normalized_x_subclass(base_adata, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+
+    class _NormalizedView(VCSCAnnData):
+        @property
+        def X(self):
+            return self.normalized("parafac2")
+
+    nv = _NormalizedView.from_anndata(base_adata, include_raw=False)
+    m = nv.to_memory()
+    assert type(m) is _NormalizedView
+    m_x, nv_x = m.X, nv.X
+    assert m_x is not None
+    assert nv_x is not None
+    np.testing.assert_allclose(m_x.toarray(), nv_x.toarray())
