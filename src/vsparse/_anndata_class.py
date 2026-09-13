@@ -246,6 +246,24 @@ class VCSCAnnData(ad.AnnData):
             layers={k: _copy_value(v) for k, v in self.layers.items() if k is not None},
         )
 
+    def to_memory(self, *, copy: bool = False) -> VCSCAnnData:
+        """Return this object with its data loaded into memory.
+
+        The inherited :meth:`anndata.AnnData.to_memory` has the same problem
+        as the inherited ``copy()`` (see above): it iterates the object's
+        *standard* attributes, which never includes this class's ``X``/
+        ``raw_X`` (held in ``_vcs_X``/``_vcs_raw_X`` instead), and reconstructs
+        a plain ``AnnData`` -- so ``X`` silently comes back ``None``.
+
+        This class never actually supports a lazily backed ``X``/``raw_X``
+        (they're always eagerly-held ``VCSCArray``/``VCSRArray`` instances),
+        so there is never anything to load -- this always returns a full
+        :meth:`copy` instead, regardless of ``copy`` (unlike plain
+        ``AnnData``, where ``copy=False`` can skip copying arrays already in
+        memory; here everything already is, so the distinction doesn't apply).
+        """
+        return self.copy()
+
     # -- normalization ----------------------------------------------------------
 
     def normalized(self, view: str | Recipe = DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
