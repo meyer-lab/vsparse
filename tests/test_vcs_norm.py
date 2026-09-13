@@ -121,13 +121,17 @@ def test_all_zero_matrix_does_not_crash(vcls):
     np.testing.assert_allclose(nv.toarray(), np.zeros((5, 4)))
 
 
-def test_small_array_dual_is_cached_lazily(dense, vcls):
-    """An array whose whole regrouping fits one chunk is transposed once and kept."""
+def test_matmul_never_builds_a_second_copy_of_the_array(dense, vcls):
+    """Neither matmul direction builds an opposite-format copy of the array.
+
+    See ``tests/test_minor_axis_matmul.py`` for the misaligned direction's own
+    correctness/memory-bound coverage; this just confirms the view stays thin.
+    """
     if dense.sum() == 0:
         pytest.skip("all-zero matrix: median row total is 0")
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     nv = v.normalized()
-    assert nv._dual_arr is None  # not built at construction
+    assert nv._arr is v
 
     rng = np.random.default_rng(12)
     B = rng.normal(size=(dense.shape[1], 3))
@@ -135,13 +139,8 @@ def test_small_array_dual_is_cached_lazily(dense, vcls):
     nv @ B  # major-aligned for VCSR self@B; misaligned for VCSC
     Bl @ nv  # major-aligned for VCSC B@self; misaligned for VCSR
 
-    dual_after_matmul = nv._dual_arr
-    assert dual_after_matmul is not None
-    assert dual_after_matmul._format != v._format
-
-    nv @ B
-    Bl @ nv
-    assert nv._dual_arr is dual_after_matmul  # reused, not rebuilt
+    assert nv._arr is v  # still the original array, not replaced by a dual
+    assert not hasattr(nv, "_dual_arr")
 
 
 def test_transpose_major_roundtrip(dense, vcls):

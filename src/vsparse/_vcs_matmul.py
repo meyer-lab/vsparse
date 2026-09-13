@@ -18,17 +18,34 @@ exactly the output's disjoint axis (:class:`~vsparse.VCSRArray` for
 ``self @ B``, :class:`~vsparse.VCSCArray` for ``B @ self`` -- see
 :func:`_vcsr_matmul_delta`/:func:`_vcsc_rmatmul_delta`). The other direction
 on a given array (:class:`~vsparse.VCSCArray` for ``self @ B``,
-:class:`~vsparse.VCSRArray` for ``B @ self``) doesn't have that alignment --
-rather than run a scatter kernel there (thread-local output-shaped
-accumulators, reduced across threads: cache-unfriendly, and memory-hungry
-enough for wide ``B`` to need throttling), the storage is regrouped into the
-other VCS format via :meth:`~vsparse._base._VCSBase._transpose_major`, a
-chunk of major slices at a time so the extra memory is one chunk's worth
-rather than a second copy of the array.
+:class:`~vsparse.VCSRArray` for ``B @ self``) doesn't have that alignment:
+parallelizing naively over major slices there would have different threads
+scatter-add into the *same* output row/column, a data race.
 
-``row_scale``/``gene_scale``/``col_mean``/``col_post_scale`` are per-row/
-per-column statistics, so a chunk just takes the slice of them its own axis
-covers.
+That misaligned direction is handled the same way :mod:`vsparse._ops`
+already handles the minor-axis reductions (``minor_sums``/``minor_counts``/
+``minor_extrema``): each thread gets its own private, full-output-sized
+accumulator and walks a disjoint contiguous range of major slices, scattering
+into that private copy; the per-thread copies are summed once at the end
+(:func:`_vcsc_matmul_delta_minor`/:func:`_vcsr_rmatmul_delta_minor`). No
+second copy of the sparse array's structure is ever built, and no chunk of it
+is ever regrouped into the other VCS format -- the kernel walks the array's
+own ``indices`` exactly as stored, so the cost of a call is ``O(nnz * width)``
+work plus one fixed-size accumulator allocation, never a sequence of
+allocate/free cycles that scales with array size.
+
+The one thing this can't avoid is that the accumulator block itself costs
+``nthreads * out_major_dim * width * 8`` bytes.
+:func:`~vsparse._ops.accumulator_threads` (shared with the reduction
+kernels) caps ``nthreads`` to keep that block under a fixed budget -- for a
+huge output axis (e.g. millions of cells) that caps down to a single thread,
+trading parallelism for a hard memory bound. That is the right trade at
+that scale: a small, constant footprint and a correct answer, rather than
+either an unbounded thread count or a chunked-transpose fallback whose total
+allocation churn (thousands of variably-sized chunk buffers, over many
+power iterations and many ranks/trials in a BiCV sweep) is what previously
+fragmented the allocator and drove RSS up to ~140 GB on a shared machine
+(see the project issue this replaced).
 """
 
 from __future__ import annotations
@@ -39,6 +56,7 @@ import numba
 import numpy as np
 
 from vsparse._norm_common import _g
+from vsparse._ops import accumulator_threads
 
 if TYPE_CHECKING:
     from vsparse._vcs_norm import _VCSNormalizedBase
@@ -104,60 +122,97 @@ def _vcsc_rmatmul_delta(
                     acc[c] += delta * brow[c]
 
 
-# ``Delta @ B`` splits over the contracted axis and ``B @ Delta`` over rows,
-# so a contiguous range of major slices can be regrouped on its own,
-# accumulated into the shared output, and dropped.
-
-_CHUNK_BUDGET_BYTES = 128 << 20  # 128 MiB of transient regrouping per chunk
-
-# transpose_major sorts globally over the chunk's nonzeros, so its peak is
-# several nnz-sized temporaries. Deliberately generous, since underestimating
-# means the budget doesn't hold.
-_TRANSPOSE_BYTES_PER_NNZ = 64
+# -- misaligned direction: per-thread private accumulators, no regrouping ----
 
 
-def _chunk_bounds(arr, budget_bytes: int) -> list[tuple[int, int]]:
-    """Contiguous ``[start, stop)`` major-slice ranges, each within the byte budget."""
-    n_major = arr.n_major
-    if n_major == 0:
-        return []
-    max_nnz = max(1, budget_bytes // _TRANSPOSE_BYTES_PER_NNZ)
-    if arr.nnz <= max_nnz:
-        return [(0, n_major)]
+@numba.njit(cache=True, parallel=True)
+def _vcsc_matmul_delta_minor(
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    row_scale,
+    gene_scale,
+    col_post_scale,
+    g_code,
+    B,
+    nthreads,
+    n_rows,
+):
+    """``Delta @ B`` for a VCSC array (major=columns), walked directly (no VCSR regroup).
 
-    # nnz of major slices [0, j) -- value_ptr indexed by the group boundary.
-    cumulative = arr.value_ptr[arr.major_ptr]
-    bounds = []
-    start = 0
-    while start < n_major:
-        # Furthest stop whose chunk stays under budget; always advance by >= 1.
-        stop = int(np.searchsorted(cumulative, cumulative[start] + max_nnz, side="right")) - 1
-        stop = min(max(stop, start + 1), n_major)
-        bounds.append((start, stop))
-        start = stop
-    return bounds
+    ``B`` is ``(n_cols, k)``; returns ``(n_rows, k)``. Parallel-safe because
+    each thread scatters into its own private ``(n_rows, k)`` accumulator
+    while owning a disjoint, contiguous range of columns.
+    """
+    n_major = major_ptr.shape[0] - 1  # n_cols
+    k = B.shape[1]
+    chunk = (n_major + nthreads - 1) // nthreads
+    partial = np.zeros((nthreads, n_rows, k), dtype=np.float64)
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * chunk
+        stop = min(n_major, start + chunk)
+        local = partial[t]
+        for j in range(start, stop):
+            gs = gene_scale[j]
+            if gs == 0.0:
+                continue
+            s = col_post_scale[j]
+            brow = B[j]
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                v = values[u]
+                for kk in range(value_ptr[u], value_ptr[u + 1]):
+                    row = indices[kk]
+                    delta = s * _g(v / row_scale[row] / gs, g_code)
+                    acc = local[row]
+                    for c in range(k):
+                        acc[c] += delta * brow[c]
+    return partial.sum(axis=0)
 
 
-def _aligned_source(nview: _VCSNormalizedBase, needed_format: str):
-    """``(array, None)`` to run one major-aligned pass, or ``(None, chunk bounds)``."""
-    arr = nview._arr
-    if arr._format == needed_format:
-        return arr, None
-    if nview._dual_arr is not None:
-        return nview._dual_arr, None
-    bounds = _chunk_bounds(arr, _CHUNK_BUDGET_BYTES)
-    if len(bounds) <= 1:
-        # Regrouping the whole array already fits the per-call budget, so
-        # keeping it costs no extra peak memory and saves every later call.
-        return _build_dual(nview), None
-    return None, bounds
+@numba.njit(cache=True, parallel=True)
+def _vcsr_rmatmul_delta_minor(
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    row_scale,
+    gene_scale,
+    col_post_scale,
+    g_code,
+    Bt,
+    nthreads,
+    n_cols,
+):
+    """``B @ Delta`` for a VCSR array (major=rows), walked directly (no VCSC regroup).
 
-
-def _build_dual(nview: _VCSNormalizedBase):
-    """Build and cache the opposite-format copy of ``nview``'s array, once."""
-    if nview._dual_arr is None:
-        nview._dual_arr = nview._arr._transpose_major()
-    return nview._dual_arr
+    ``Bt`` is ``(n_rows, p)`` (``B`` transposed); returns ``(n_cols, p)``.
+    Parallel-safe because each thread scatters into its own private
+    ``(n_cols, p)`` accumulator while owning a disjoint, contiguous range of
+    rows.
+    """
+    n_major = major_ptr.shape[0] - 1  # n_rows
+    p = Bt.shape[1]
+    chunk = (n_major + nthreads - 1) // nthreads
+    partial = np.zeros((nthreads, n_cols, p), dtype=np.float64)
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * chunk
+        stop = min(n_major, start + chunk)
+        local = partial[t]
+        for i in range(start, stop):
+            rs = row_scale[i]
+            brow = Bt[i]
+            for u in range(major_ptr[i], major_ptr[i + 1]):
+                v = values[u]
+                for kk in range(value_ptr[u], value_ptr[u + 1]):
+                    col = indices[kk]
+                    gs = gene_scale[col]
+                    if gs > 0.0:
+                        delta = col_post_scale[col] * _g(v / rs / gs, g_code)
+                        acc = local[col]
+                        for c in range(p):
+                            acc[c] += delta * brow[c]
+    return partial.sum(axis=0)
 
 
 # -- public entry points: dense correction + sparse delta -------------------
@@ -182,14 +237,13 @@ def normalized_at_dense(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
 
     g_code = nview.recipe.g_code
 
-    # self @ B is major-aligned for VCSR; a VCSC array needs regrouping.
-    src, bounds = _aligned_source(nview, "csr")
-    if src is not None:
+    if arr._format == "csr":
+        # self @ B is major-aligned for VCSR.
         _vcsr_matmul_delta(
-            src.major_ptr,
-            src.values,
-            src.value_ptr,
-            src.indices,
+            arr.major_ptr,
+            arr.values,
+            arr.value_ptr,
+            arr.indices,
             nview.row_scale,
             nview.gene_scale,
             nview.col_post_scale,
@@ -198,23 +252,21 @@ def normalized_at_dense(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             out,
         )
     else:
-        # Column chunk at a time: Delta @ B == sum over chunks of
-        # Delta[:, chunk] @ B[chunk, :], so each chunk's contribution
-        # accumulates into the same output and is then discarded.
-        for start, stop in bounds:
-            chunk = arr._major_range(start, stop)._transpose_major()
-            _vcsr_matmul_delta(
-                chunk.major_ptr,
-                chunk.values,
-                chunk.value_ptr,
-                chunk.indices,
-                nview.row_scale,
-                nview.gene_scale[start:stop],
-                nview.col_post_scale[start:stop],
-                g_code,
-                np.ascontiguousarray(B[start:stop]),
-                out,
-            )
+        # arr is VCSC: self @ B is the misaligned direction for this format.
+        nthreads = accumulator_threads(arr.shape[0], bytes_per_element=8 * B.shape[1])
+        out += _vcsc_matmul_delta_minor(
+            arr.major_ptr,
+            arr.values,
+            arr.value_ptr,
+            arr.indices,
+            nview.row_scale,
+            nview.gene_scale,
+            nview.col_post_scale,
+            g_code,
+            B,
+            nthreads,
+            arr.shape[0],
+        )
 
     offset = nview.col_mean * nview.col_post_scale
     baseline = (-offset) @ B  # (k,): every row's implicit-zero contribution
@@ -238,14 +290,13 @@ def dense_at_normalized(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
 
     g_code = nview.recipe.g_code
 
-    # B @ self is major-aligned for VCSC; a VCSR array needs regrouping.
-    src, bounds = _aligned_source(nview, "csc")
-    if src is not None:
+    if arr._format == "csc":
+        # B @ self is major-aligned for VCSC.
         _vcsc_rmatmul_delta(
-            src.major_ptr,
-            src.values,
-            src.value_ptr,
-            src.indices,
+            arr.major_ptr,
+            arr.values,
+            arr.value_ptr,
+            arr.indices,
             nview.row_scale,
             nview.gene_scale,
             nview.col_post_scale,
@@ -254,21 +305,21 @@ def dense_at_normalized(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             out_t,
         )
     else:
-        # Row chunk at a time, accumulating into the same output.
-        for start, stop in bounds:
-            chunk = arr._major_range(start, stop)._transpose_major()
-            _vcsc_rmatmul_delta(
-                chunk.major_ptr,
-                chunk.values,
-                chunk.value_ptr,
-                chunk.indices,
-                nview.row_scale[start:stop],
-                nview.gene_scale,
-                nview.col_post_scale,
-                g_code,
-                np.ascontiguousarray(Bt[start:stop]),
-                out_t,
-            )
+        # arr is VCSR: B @ self is the misaligned direction for this format.
+        nthreads = accumulator_threads(arr.shape[1], bytes_per_element=8 * p)
+        out_t += _vcsr_rmatmul_delta_minor(
+            arr.major_ptr,
+            arr.values,
+            arr.value_ptr,
+            arr.indices,
+            nview.row_scale,
+            nview.gene_scale,
+            nview.col_post_scale,
+            g_code,
+            Bt,
+            nthreads,
+            arr.shape[1],
+        )
 
     out = np.ascontiguousarray(out_t.T)
     offset = nview.col_mean * nview.col_post_scale

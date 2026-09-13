@@ -138,12 +138,10 @@ NORM_CACHE_MAXSIZE = 4
 class _NormCache:
     """Bounded LRU of computed normalizations for one array, keyed by :class:`Recipe`.
 
-    Holds each view's *statistics* strongly and the view itself only weakly.
-    That split matters: a view can carry an ``O(nnz)`` ``_dual_arr`` (a whole
-    opposite-format copy of the array, cached by the matmul kernels), and a
-    cache that kept views alive would pin one of those per recipe for as long
-    as the array lived, even after the caller had dropped every reference.
-    The statistics are ``O(n_rows + n_cols)``, so retaining those is cheap.
+    Holds each view's *statistics* strongly and the view itself only weakly,
+    so a cache hit never pins a view alive for longer than the caller's own
+    references would. The statistics are ``O(n_rows + n_cols)``, so retaining
+    those is cheap.
 
     A hit on a still-live view hands back that exact object, so
     ``recalculate=False`` is identity-stable for as long as the caller holds
@@ -786,7 +784,7 @@ class NormalizedViewBase:
         return self
 
     def _init_extra(self) -> None:
-        """Hook for subclasses with extra per-instance state (e.g. ``_dual_arr``).
+        """Hook for subclasses with extra per-instance state to initialize.
 
         ``__init__`` normally initializes that state itself; :meth:`from_stats`
         builds an instance via ``object.__new__`` instead, bypassing it, so it
