@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy as _copy
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -67,6 +68,16 @@ def _subset_2d(v: Any, oidx: Any, vidx: Any) -> Any:
     if sp.issparse(v):
         return v[oidx, :][:, vidx]
     return np.asarray(v)[oidx][:, vidx]
+
+
+def _copy_value(v: Any) -> Any:
+    """A deep-enough copy of one obs/var/obsm/varm/obsp/varp/layers value.
+
+    Every value anndata can hold there -- a DataFrame, ndarray, scipy sparse
+    array, or a :class:`~vsparse.VCSCArray`/:class:`~vsparse.VCSRArray` --
+    implements its own ``.copy()``.
+    """
+    return None if v is None else v.copy()
 
 
 def _check_vcs_type(value: Any, name: str) -> None:
@@ -176,6 +187,11 @@ class VCSCAnnData(ad.AnnData):
         this class doesn't use (see the class docstring), so it can't be
         reused here. ``X``/``raw_X`` stay VCSC/VCSR-backed either way, via
         that array type's own indexing.
+
+        Returns ``type(self)``, not a bare ``VCSCAnnData``, so a subclass
+        overriding ``X`` (e.g. one that always hands back a normalized view
+        computed fresh from ``_vcs_X``, as with :meth:`copy`/:meth:`to_memory`)
+        keeps that behavior after slicing.
         """
         oidx, vidx = self._normalize_indices(index)
         oidx = _as_slice_index(oidx, self.n_obs)
@@ -197,7 +213,7 @@ class VCSCAnnData(ad.AnnData):
         if _VSPARSE_UNS_KEY in uns:
             uns = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
 
-        return VCSCAnnData(
+        return type(self)(
             X=_subset_2d(self._vcs_X, oidx, vidx),
             raw_X=_subset_2d(self._vcs_raw_X, oidx, vidx),
             obs=obs,
@@ -209,6 +225,49 @@ class VCSCAnnData(ad.AnnData):
             varp={k: _subset_2d(v, vidx, vidx) for k, v in self.varp.items() if k is not None},
             layers={k: _subset_2d(v, oidx, vidx) for k, v in self.layers.items() if k is not None},
         )
+
+    def copy(self) -> VCSCAnnData:  # ty: ignore[invalid-method-override]
+        """A deep copy, preserving the VCSC/VCSR-backed ``X``/``raw_X``.
+
+        The inherited :meth:`anndata.AnnData.copy` only knows how to copy the
+        standard private ``_X`` attribute, which this class never sets (see
+        the class docstring: ``X``/``raw_X`` live in ``_vcs_X``/``_vcs_raw_X``
+        instead) -- so it silently drops them (``X`` comes back ``None``) and
+        returns a plain ``AnnData`` rather than this class. This copies every
+        field explicitly instead, including a real ``VCSCArray``/
+        ``VCSRArray`` copy of ``X``/``raw_X``, and returns ``type(self)`` so a
+        subclass (e.g. one overriding the ``X`` property) round-trips too.
+        """
+        return type(self)(
+            X=_copy_value(self._vcs_X),
+            raw_X=_copy_value(self._vcs_raw_X),
+            obs=cast(pd.DataFrame, self.obs).copy(),
+            var=cast(pd.DataFrame, self.var).copy(),
+            uns=_copy.deepcopy(dict(self.uns)),
+            obsm={k: _copy_value(v) for k, v in self.obsm.items() if k is not None},
+            varm={k: _copy_value(v) for k, v in self.varm.items() if k is not None},
+            obsp={k: _copy_value(v) for k, v in self.obsp.items() if k is not None},
+            varp={k: _copy_value(v) for k, v in self.varp.items() if k is not None},
+            layers={k: _copy_value(v) for k, v in self.layers.items() if k is not None},
+        )
+
+    def to_memory(self, *, copy: bool = False) -> VCSCAnnData:
+        """Return this object with its data loaded into memory.
+
+        The inherited :meth:`anndata.AnnData.to_memory` has the same problem
+        as the inherited ``copy()`` (see above): it iterates the object's
+        *standard* attributes, which never includes this class's ``X``/
+        ``raw_X`` (held in ``_vcs_X``/``_vcs_raw_X`` instead), and reconstructs
+        a plain ``AnnData`` -- so ``X`` silently comes back ``None``.
+
+        This class never actually supports a lazily backed ``X``/``raw_X``
+        (they're always eagerly-held ``VCSCArray``/``VCSRArray`` instances),
+        so there is never anything to load -- this always returns a full
+        :meth:`copy` instead, regardless of ``copy`` (unlike plain
+        ``AnnData``, where ``copy=False`` can skip copying arrays already in
+        memory; here everything already is, so the distinction doesn't apply).
+        """
+        return self.copy()
 
     # -- normalization ----------------------------------------------------------
 

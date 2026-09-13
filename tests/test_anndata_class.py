@@ -251,3 +251,126 @@ def test_getitem_single_int_row(base_adata, dense):
     assert sub.shape == (1, dense.shape[1])
     assert isinstance(sub.X, VCSCArray)
     np.testing.assert_allclose(sub.X.toarray(), dense[0:1])
+
+
+def test_getitem_preserves_a_subclass_overriding_x(base_adata, dense):
+    """A subclass overriding the `X` getter (as BAL-Pf2's own
+    lazy-normalized-view AnnData does) must keep that behavior after
+    slicing, not silently fall back to the raw (un-normalized) array."""
+    if dense.shape[0] < 2 or dense.sum() == 0:
+        pytest.skip("shape too small or all-zero matrix")
+
+    class _NormalizedView(VCSCAnnData):
+        @property
+        def X(self):
+            return self.normalized("parafac2")
+
+    nv = _NormalizedView.from_anndata(base_adata, include_raw=False)
+    sub = nv[0:2, :]
+    assert type(sub) is _NormalizedView
+    sub_x = sub.X
+    assert sub_x is not None
+    assert not isinstance(sub_x, VCSCArray)  # the normalized view, not the raw array
+
+    expected = VCSCArray.from_scipy(sp.csc_array(dense[0:2])).normalized("parafac2")
+    np.testing.assert_allclose(sub_x.toarray(), expected.toarray())
+
+
+# -- copy() -- the inherited anndata.AnnData.copy() only knows how to copy
+# the standard private _X attribute, which this class never sets (X/raw_X
+# live in _vcs_X/_vcs_raw_X instead), so it silently drops them.
+
+
+def test_copy_preserves_x_and_raw_x(base_adata, dense):
+    va = VCSCAnnData.from_anndata(base_adata)
+    c = va.copy()
+    assert type(c) is VCSCAnnData
+    assert isinstance(c.X, VCSCArray)
+    assert isinstance(c.raw_X, VCSCArray)
+    np.testing.assert_allclose(c.X.toarray(), dense)
+    np.testing.assert_allclose(c.raw_X.toarray(), dense)
+
+
+def test_copy_is_independent_of_the_original(base_adata, dense):
+    if dense.shape[0] == 0 or dense.shape[1] == 0:
+        pytest.skip("shape too small")
+    va = VCSCAnnData.from_anndata(base_adata, include_raw=False)
+    c = va.copy()
+    assert c.X is not va.X
+    assert c.obs is not va.obs
+
+    c.obs["grp"] = "mutated"
+    assert list(va.obs["grp"]) != list(c.obs["grp"])
+
+
+def test_copy_preserves_obs_var_uns(base_adata, dense):
+    base_adata.uns["note"] = {"k": "v"}
+    va = VCSCAnnData.from_anndata(base_adata, include_raw=False)
+    c = va.copy()
+    assert list(c.obs["grp"]) == list(va.obs["grp"])
+    assert list(c.var["gene"]) == list(va.var["gene"])
+    assert c.uns["note"] == {"k": "v"}
+
+
+def test_copy_preserves_a_normalized_x_subclass(base_adata, dense):
+    """A subclass overriding the `X` getter (as BAL-Pf2's own
+    lazy-normalized-view AnnData does) must round-trip through copy()."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+
+    class _NormalizedView(VCSCAnnData):
+        @property
+        def X(self):
+            return self.normalized("parafac2")
+
+    nv = _NormalizedView.from_anndata(base_adata, include_raw=False)
+    c = nv.copy()
+    assert type(c) is _NormalizedView
+    c_x, nv_x = c.X, nv.X
+    assert c_x is not None
+    assert nv_x is not None
+    np.testing.assert_allclose(c_x.toarray(), nv_x.toarray())
+
+
+def test_copy_of_a_slice_round_trips_x(base_adata, dense):
+    """The exact pattern a caller like `parafac2`'s BiCV split uses:
+    `adata[obs_mask][:, var_mask].copy()`."""
+    if dense.shape[0] < 2 or dense.shape[1] < 2:
+        pytest.skip("shape too small")
+    va = VCSCAnnData.from_anndata(base_adata, include_raw=False)
+    sub = va[0:2, 0:2]
+    c = sub.copy()
+    assert c.X is not None
+    np.testing.assert_allclose(c.X.toarray(), dense[0:2, 0:2])
+
+
+# -- to_memory() -- same underlying problem as copy(): the inherited
+# anndata.AnnData.to_memory() doesn't know about _vcs_X/_vcs_raw_X either.
+
+
+def test_to_memory_preserves_x_and_raw_x(base_adata, dense):
+    va = VCSCAnnData.from_anndata(base_adata)
+    m = va.to_memory()
+    assert type(m) is VCSCAnnData
+    assert isinstance(m.X, VCSCArray)
+    assert isinstance(m.raw_X, VCSCArray)
+    np.testing.assert_allclose(m.X.toarray(), dense)
+    np.testing.assert_allclose(m.raw_X.toarray(), dense)
+
+
+def test_to_memory_preserves_a_normalized_x_subclass(base_adata, dense):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+
+    class _NormalizedView(VCSCAnnData):
+        @property
+        def X(self):
+            return self.normalized("parafac2")
+
+    nv = _NormalizedView.from_anndata(base_adata, include_raw=False)
+    m = nv.to_memory()
+    assert type(m) is _NormalizedView
+    m_x, nv_x = m.X, nv.X
+    assert m_x is not None
+    assert nv_x is not None
+    np.testing.assert_allclose(m_x.toarray(), nv_x.toarray())
