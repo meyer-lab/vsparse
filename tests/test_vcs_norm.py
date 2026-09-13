@@ -150,3 +150,49 @@ def test_transpose_major_roundtrip(dense, vcls):
     assert dual.shape == v.shape
     assert dual._format != v._format
     np.testing.assert_allclose(dual.toarray(), dense)
+
+
+# -- norm_sq / slice_norms / to_scipy_sparse: numeric correctness is
+# property-tested in test_property_norm_stats.py -----------------------------
+
+
+def test_norm_sq_all_zero_matrix_is_zero(vcls):
+    dense = np.zeros((5, 4))
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    assert nv.norm_sq() == 0.0
+
+
+def test_slice_norms_all_zero_matrix_is_all_zero(vcls):
+    dense = np.zeros((5, 4))
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    np.testing.assert_allclose(nv.slice_norms(np.array([0, 0, 1, 1, 1]), 2), 0.0)
+
+
+def test_to_scipy_sparse_all_zero_matrix_is_empty(vcls):
+    dense = np.zeros((5, 4))
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    sparse = nv.to_scipy_sparse()
+    assert sparse.shape == (5, 4)
+    assert sparse.nnz == 0
+    np.testing.assert_allclose(nv.means, 0.0)
+
+
+def test_to_scipy_sparse_matches_format(dense, vcls):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    sparse = nv.to_scipy_sparse()
+    assert isinstance(sparse, sp.csc_array if vcls is VCSCArray else sp.csr_array)
+    assert sparse.dtype == np.float64
+
+
+def test_means_property_matches_c_times_s(dense, vcls):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    np.testing.assert_allclose(nv.means, nv.c * nv.s)
