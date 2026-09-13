@@ -296,7 +296,7 @@ def test_recipe_with_an_unknown_g_code_is_rejected(vcls, dense):
 
 
 def test_cache_does_not_pin_a_dropped_view(vcls, dense):
-    """The cache holds views weakly, so it can't keep an O(nnz) _dual_arr alive."""
+    """The cache holds views weakly, so a dropped view is actually collected."""
     if dense.sum() == 0:
         pytest.skip("all-zero matrix: median row total is 0")
     v = vcls.from_scipy(_scipy_for(vcls, dense))
