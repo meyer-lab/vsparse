@@ -102,6 +102,58 @@ def test_select_returns_a_view_that_still_composes(vcls):
     np.testing.assert_allclose(sub @ B, _reference(dense[mask]) @ B, atol=1e-8)
 
 
+# -- select(recalculate=False): a window that stays a lazy view -------------
+
+
+def test_select_no_recalculate_matches_getitem_values(vcls):
+    """select(recalculate=False) keeps the parent's statistics, like __getitem__."""
+    dense, mask = _mixed_population()
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
+
+    want = np.asarray(nv[mask, :])
+    got = nv.select(mask, recalculate=False).toarray()
+
+    np.testing.assert_allclose(got, want, atol=1e-10)
+
+
+def test_select_no_recalculate_returns_a_lazy_view(vcls):
+    """Unlike __getitem__, this never eagerly materializes the selection."""
+    dense, mask = _mixed_population()
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
+
+    sub = nv.select(mask, recalculate=False)
+    assert isinstance(sub, _norm_cls(vcls))
+    assert sub.shape == (int(mask.sum()), dense.shape[1])
+
+    rng = np.random.default_rng(5)
+    B = rng.normal(size=(dense.shape[1], 4))
+    Bl = rng.normal(size=(3, int(mask.sum())))
+    want = np.asarray(nv[mask, :])
+    np.testing.assert_allclose(sub @ B, want @ B, atol=1e-8)
+    np.testing.assert_allclose(Bl @ sub, Bl @ want, atol=1e-8)
+
+
+def test_select_no_recalculate_composes_with_column_selection_too(vcls):
+    """A column selection just slices the existing per-gene stats, not recomputed."""
+    dense, mask = _mixed_population()
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
+    cols = np.array([0, 3, 7, 15, 40])
+
+    want = np.asarray(nv[mask, :])[:, cols]
+    got = nv.select(mask, cols, recalculate=False).toarray()
+    np.testing.assert_allclose(got, want, atol=1e-10)
+
+
+def test_select_no_recalculate_default_recalculate_still_recomputes(vcls):
+    """Bare select(mask) is unaffected by the new keyword-only argument."""
+    dense, mask = _mixed_population()
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized()
+
+    np.testing.assert_allclose(
+        nv.select(mask).toarray(), nv.select(mask, recalculate=True).toarray(), atol=1e-12
+    )
+
+
 # -- __getitem__: a window that keeps the parent's statistics ----------------
 
 

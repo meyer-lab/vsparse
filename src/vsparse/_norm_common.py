@@ -983,18 +983,50 @@ class NormalizedViewBase:
 
     # -- selection ---------------------------------------------------------------
 
-    def select(self, rows: Any = slice(None), cols: Any = slice(None)) -> Any:
-        """A normalized view of the selected sub-array, with statistics recomputed for it.
+    def select(
+        self, rows: Any = slice(None), cols: Any = slice(None), *, recalculate: bool = True
+    ) -> Any:
+        """A normalized view of the selected sub-array.
 
         Returns a view, not a dense array, so it still composes with
-        ``@``/:meth:`toarray`.
+        ``@``/:meth:`toarray` without ever materializing the selection.
+
+        Parameters
+        ----------
+        recalculate
+            If ``True`` (the default), statistics are recomputed fresh from
+            the selected sub-array -- a column selection then re-derives
+            read depth from only the selected columns, which is rarely what
+            a caller wants (select genes first and normalize after if it
+            matters). If ``False``, this view's *existing* statistics are
+            reused instead: ``row_scale``/``a`` sliced by ``rows`` (a
+            per-cell quantity, so subsetting is exact, not an
+            approximation), and the per-gene statistics (``gene_scale``/
+            ``col_mean``/``col_post_scale``, i.e. ``b``/``c``/``s``) sliced
+            by ``cols`` unchanged. This is the right choice for evaluating a
+            model fit on a held-out slice against statistics computed on
+            the whole (or a different) array -- e.g. bi-cross-validation
+            scoring a test block against train-derived statistics -- and,
+            unlike bracket indexing (:meth:`__getitem__`), stays a lazy view
+            no matter how large the selection is: nothing gets materialized
+            until (and unless) the caller calls :meth:`toarray` or `@`s it,
+            and even then the O(nnz) work is bounded, not an eager dense
+            allocation sized to the selection.
         """
-        # A column selection re-derives read depth from only the selected
-        # columns, which is rarely what a caller wants; select genes first
-        # and normalize after if it matters.
-        sub: Any = self._arr[_prep_key(rows), _prep_key(cols)]
+        row_key, col_key = _prep_key(rows), _prep_key(cols)
+        sub: Any = self._arr[row_key, col_key]
         if not isinstance(sub, type(self._arr)):
             sub = type(self._arr).from_scipy(sub)
+        if not recalculate:
+            return type(self).from_stats(
+                sub,
+                self.recipe,
+                np.asarray(self.a)[row_key],
+                np.asarray(self.b)[col_key],
+                np.asarray(self.c)[col_key],
+                np.asarray(self.s)[col_key],
+                stale=self.stale,
+            )
         return type(self)(sub, self.recipe)
 
     # -- on-the-fly elementwise access ------------------------------------------
