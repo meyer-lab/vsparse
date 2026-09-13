@@ -253,6 +253,29 @@ def test_getitem_single_int_row(base_adata, dense):
     np.testing.assert_allclose(sub.X.toarray(), dense[0:1])
 
 
+def test_getitem_preserves_a_subclass_overriding_x(base_adata, dense):
+    """A subclass overriding the `X` getter (as BAL-Pf2's own
+    lazy-normalized-view AnnData does) must keep that behavior after
+    slicing, not silently fall back to the raw (un-normalized) array."""
+    if dense.shape[0] < 2 or dense.sum() == 0:
+        pytest.skip("shape too small or all-zero matrix")
+
+    class _NormalizedView(VCSCAnnData):
+        @property
+        def X(self):
+            return self.normalized("parafac2")
+
+    nv = _NormalizedView.from_anndata(base_adata, include_raw=False)
+    sub = nv[0:2, :]
+    assert type(sub) is _NormalizedView
+    sub_x = sub.X
+    assert sub_x is not None
+    assert not isinstance(sub_x, VCSCArray)  # the normalized view, not the raw array
+
+    expected = VCSCArray.from_scipy(sp.csc_array(dense[0:2])).normalized("parafac2")
+    np.testing.assert_allclose(sub_x.toarray(), expected.toarray())
+
+
 # -- copy() -- the inherited anndata.AnnData.copy() only knows how to copy
 # the standard private _X attribute, which this class never sets (X/raw_X
 # live in _vcs_X/_vcs_raw_X instead), so it silently drops them.

@@ -187,6 +187,11 @@ class VCSCAnnData(ad.AnnData):
         this class doesn't use (see the class docstring), so it can't be
         reused here. ``X``/``raw_X`` stay VCSC/VCSR-backed either way, via
         that array type's own indexing.
+
+        Returns ``type(self)``, not a bare ``VCSCAnnData``, so a subclass
+        overriding ``X`` (e.g. one that always hands back a normalized view
+        computed fresh from ``_vcs_X``, as with :meth:`copy`/:meth:`to_memory`)
+        keeps that behavior after slicing.
         """
         oidx, vidx = self._normalize_indices(index)
         oidx = _as_slice_index(oidx, self.n_obs)
@@ -208,7 +213,7 @@ class VCSCAnnData(ad.AnnData):
         if _VSPARSE_UNS_KEY in uns:
             uns = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
 
-        return VCSCAnnData(
+        return type(self)(
             X=_subset_2d(self._vcs_X, oidx, vidx),
             raw_X=_subset_2d(self._vcs_raw_X, oidx, vidx),
             obs=obs,
