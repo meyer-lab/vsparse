@@ -189,6 +189,20 @@ def test_to_scipy_sparse_matches_format(dense, vcls):
     assert sparse.dtype == np.float64
 
 
+def test_to_scipy_sparse_dtype_argument(dense, vcls):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    nv = v.normalized()
+    default = nv.to_scipy_sparse()
+    f32 = nv.to_scipy_sparse(dtype=np.float32)
+    assert f32.dtype == np.float32
+    assert f32.nnz == default.nnz
+    np.testing.assert_allclose(
+        f32.toarray(), default.toarray().astype(np.float32), rtol=1e-5, atol=1e-5
+    )
+
+
 def test_means_property_matches_c_times_s(dense, vcls):
     if dense.sum() == 0:
         pytest.skip("all-zero matrix: median row total is 0")
