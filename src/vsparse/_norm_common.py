@@ -59,6 +59,7 @@ from typing import Any
 
 import numba
 import numpy as np
+import numpy.typing as npt
 
 __all__ = [
     "DEFAULT_RECIPE",
@@ -872,7 +873,7 @@ class NormalizedViewBase:
             )
         return out
 
-    def to_scipy_sparse(self) -> Any:
+    def to_scipy_sparse(self, dtype: npt.DTypeLike = np.float64) -> Any:
         """The uncentered, scaled sparse ``Delta`` term, as a real scipy sparse array.
 
         Same sparsity pattern as the underlying raw array (a ``csr_array``
@@ -881,11 +882,23 @@ class NormalizedViewBase:
         this view to code (such as ``parafac2``'s CuPy/MLX GPU backends)
         that only knows how to move a plain NumPy/SciPy array onto a device,
         rather than this view's own ``__matmul__``/``__rmatmul__``.
+
+        Parameters
+        ----------
+        dtype : numpy dtype-like, default ``np.float64``
+            Dtype of the returned array's ``data`` (values only -- indices
+            stay at their existing width). Pass e.g. ``np.float32`` to
+            materialize directly in a lower-precision dtype instead of
+            materializing at float64 and downcasting afterwards, which
+            briefly holds both the float64 and downcast copies in memory at
+            once for no benefit when the caller only ever wanted the
+            smaller dtype (e.g. to match a GPU backend's own float32
+            working precision).
         """
         import scipy.sparse as sp
 
         arr = self._arr
-        data = np.empty(arr.nnz, dtype=np.float64)
+        data = np.empty(arr.nnz, dtype=dtype)
         if self._format == "csc":
             _materialize_delta_major_is_col(
                 arr.major_ptr,
