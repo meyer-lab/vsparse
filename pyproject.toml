@@ -1,6 +1,6 @@
 [project]
 name = "vsparse"
-version = "0.3.0"
+version = "0.4.0"
 description = "Value-Compressed Sparse Column/Row (VCSC/VCSR) arrays, with optional AnnData integration"
 readme = "README.md"
 authors = [
