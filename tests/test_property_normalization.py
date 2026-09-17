@@ -83,7 +83,12 @@ def _recipe_reference(dense: np.ndarray, recipe: str) -> np.ndarray:
     if recipe in ("scanpy", "pearson"):
         std = g.std(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            s = np.where(std > 0, 1.0 / std, 1.0)
+            # A column with no real variance leaves only rounding noise in
+            # `std`; dividing by it amplifies noise instead of scaling. Judge
+            # "no variance" relative to the column's own magnitude, as
+            # `_zero_variance_tol` does in the library.
+            tol = np.sqrt(dense.shape[0] * np.finfo(np.float64).eps) * np.abs(g.mean(axis=0))
+            s = np.where(std > tol, 1.0 / std, 1.0)
     else:
         s = np.ones(dense.shape[1])
 

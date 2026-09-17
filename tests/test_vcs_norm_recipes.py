@@ -66,7 +66,12 @@ def _reference(dense: np.ndarray, recipe: str) -> np.ndarray:
     if recipe in ("scanpy", "pearson"):
         std = g.std(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            s = np.where(std > 0, 1.0 / std, 1.0)
+            # A column with no real variance leaves only rounding noise in
+            # `std`; dividing by it amplifies noise instead of scaling. Judge
+            # "no variance" relative to the column's own magnitude, as
+            # `_zero_variance_tol` does in the library.
+            tol = np.sqrt(dense.shape[0] * np.finfo(np.float64).eps) * np.abs(g.mean(axis=0))
+            s = np.where(std > tol, 1.0 / std, 1.0)
     else:
         s = np.ones(dense.shape[1])
 
@@ -356,3 +361,34 @@ def test_anndata_cache_does_not_pin_a_dropped_view():
     assert ref() is None
     # Still reusable -- from obs/varm/uns if not from the retained statistics.
     assert adata.normalized("scanpy", recalculate=False) is not None
+
+
+@pytest.mark.parametrize("n_rows", [2, 5, 6, 17, 64, 501])
+@pytest.mark.parametrize("value", [1.0, 7.0, 9999.0])
+@pytest.mark.parametrize("recipe", ["scanpy", "pearson"])
+def test_a_column_with_no_variance_centers_to_zero(vcls, n_rows, value, recipe):
+    """A constant column has no variance to scale by, so centering must leave 0.
+
+    ``variance`` is computed one-pass as ``E[x^2] - E[x]^2``, which for such a
+    column cancels to rounding noise rather than to exactly 0. Testing
+    ``std > 0`` would therefore take the dividing branch and amplify that noise
+    into an arbitrary O(1) value -- 1.05e-08 for the 6x1 case below, against
+    the 0 the same input gives at 5 rows. The scale of the noise moves with
+    the column's magnitude and with how many terms were summed, so the
+    threshold has to move with both.
+    """
+    dense = np.full((n_rows, 1), value)
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    out = v.normalized(recipe).toarray()
+    np.testing.assert_allclose(out, np.zeros_like(dense), atol=1e-12)
+
+
+def test_a_constant_column_does_not_suppress_its_neighbours(vcls):
+    """Zeroing a no-variance column must not touch the columns beside it."""
+    rng = np.random.default_rng(0)
+    dense = rng.integers(1, 50, size=(40, 5)).astype(float)
+    dense[:, 2] = 4.0
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    out = v.normalized("pearson").toarray()
+    varying = np.delete(out, 2, axis=1)
+    assert np.abs(varying).max() > 0.5

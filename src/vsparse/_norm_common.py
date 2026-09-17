@@ -608,6 +608,35 @@ def _compute_row_scale(arr: Any, recipe: Recipe) -> np.ndarray:
     return row_scale
 
 
+def _zero_variance_tol(mean: np.ndarray, n_rows: int) -> np.ndarray:
+    """Below what ``std`` a column counts as having no variance at all.
+
+    ``variance`` above is the one-pass ``E[x^2] - E[x]^2``. For a column whose
+    values are all (nearly) equal, that subtracts two numbers of size
+    ``mean ** 2`` which cancel almost completely, and what survives is rounding
+    noise rather than signal. Summing ``n_rows`` terms accumulates a relative
+    error of order ``n_rows * eps``, so the noise left in ``variance`` is of
+    order ``n_rows * eps * mean ** 2`` and the noise in ``std`` of order
+    ``sqrt(n_rows * eps) * |mean|``.
+
+    A plain ``std > 0`` test cannot see that, and dividing by such a ``std``
+    amplifies noise into the output instead of scaling anything: a constant
+    column comes back as an arbitrary O(1) value rather than the 0 that
+    centering it should give. So judge "no variance" against that noise floor,
+    which scales both with the column's magnitude and with how many terms were
+    summed to reach it.
+
+    Columns that are genuinely all zero have ``mean == 0``, hence a threshold
+    of 0, and still take the ``std > 0`` branch.
+
+    The floor is set by the one-pass formula, not by the data: a stable
+    two-pass or Welford variance would leave noise of order ``eps`` rather than
+    ``n_rows * eps`` and would admit a tighter threshold, at the cost of a
+    second pass over ``nnz``.
+    """
+    return np.sqrt(n_rows * np.finfo(np.float64).eps) * np.abs(mean)
+
+
 class NormalizedViewBase:
     """Shared implementation for the normalized VCSC/VCSR views.
 
@@ -708,7 +737,9 @@ class NormalizedViewBase:
             col_mean = mean if self.recipe.center else np.zeros(n_cols, dtype=np.float64)
             if self.recipe.post_scale:
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    col_post_scale = np.where(std > 0.0, 1.0 / std, 1.0)
+                    col_post_scale = np.where(
+                        std > _zero_variance_tol(mean, n_rows), 1.0 / std, 1.0
+                    )
             else:
                 col_post_scale = np.ones(n_cols, dtype=np.float64)
         else:
