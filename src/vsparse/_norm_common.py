@@ -608,6 +608,81 @@ def _compute_row_scale(arr: Any, recipe: Recipe) -> np.ndarray:
     return row_scale
 
 
+class _DeviceNormalizedView:
+    """A normalized view resident in GPU memory, for `parafac2`'s backends.
+
+    Holds the same decomposition :attr:`NormalizedViewBase.means` documents --
+    ``view.toarray() == view.to_scipy_sparse().toarray() - view.means`` -- with
+    the sparse ``Delta`` term on the device and the centering kept as a rank-1
+    correction applied there. Nothing is ever densified: centering a matmul
+    costs one extra dense product against a length-``n_cols`` vector.
+
+    ``parafac2.backend.GPUMatrix`` only ever ``@``-s what ``to_device``
+    returns, so those two operators are the whole contract.
+    """
+
+    # NumPy/CuPy would otherwise try to broadcast this object elementwise on
+    # `lhs @ view` instead of deferring to `__rmatmul__`. `parafac2`'s own
+    # `GPUMatrix` sets this for the same reason.
+    __array_priority__ = 1000
+
+    __slots__ = ("_delta", "_means", "shape", "dtype", "_xp", "_spmm")
+
+    def __init__(self, delta: Any, means: Any, shape: tuple[int, int], xp: Any) -> None:
+        self._delta = delta
+        self._means = means
+        self.shape = shape
+        self.dtype = np.dtype(np.float64)
+        self._xp = xp
+        # cuSPARSE's legacy SpMM is unsafe for int64-indexed matrices, and
+        # CuPy's `@` routes there. Above 2**31 nonzeros the device copy is
+        # int64-indexed no matter what the host array carries, so prefer
+        # nvmath's SpMM when it is installed -- this is the same reason
+        # `parafac2.backend` reaches for it.
+        try:
+            import nvmath  # noqa: F401
+
+            self._spmm = True
+        except ImportError:
+            self._spmm = False
+
+    def _sparse_at_dense(self, rhs: Any) -> Any:
+        if not self._spmm:
+            return self._delta @ rhs
+        import nvmath
+
+        xp = self._xp
+        # nvmath's SpMM refuses mixed precision, so the dense operand is cast
+        # to the sparse term's dtype -- the same thing `parafac2` does before
+        # its own call (`matmul(X, Omega.astype(X_dtype))`).
+        rhs_2d = rhs[:, None] if rhs.ndim == 1 else rhs
+        rhs_2d = rhs_2d.astype(self._delta.dtype, copy=False)
+        out = xp.zeros(
+            (self._delta.shape[0], rhs_2d.shape[1]), dtype=self._delta.dtype
+        )
+        res = nvmath.sparse.matmul(self._delta, rhs_2d, out)
+        return res.ravel() if rhs.ndim == 1 else res
+
+    def __matmul__(self, rhs: Any) -> Any:
+        """``self @ rhs``; the centering is a rank-1 correction, not a copy."""
+        xp = self._xp
+        rhs_d = xp.asarray(rhs).astype(self._delta.dtype, copy=False)
+        prod = self._sparse_at_dense(rhs_d)
+        # V @ R == Delta @ R - 1_n (means^T R)
+        return prod - (self._means @ rhs_d)
+
+    def __rmatmul__(self, lhs: Any) -> Any:
+        """``lhs @ self``; likewise rank-1."""
+        xp = self._xp
+        lhs_d = xp.asarray(lhs).astype(self._delta.dtype, copy=False)
+        prod = lhs_d @ self._delta
+        # L @ V == L @ Delta - (L 1_n) means^T
+        row_sums = lhs_d.sum(axis=-1)
+        if lhs_d.ndim == 1:
+            return prod - row_sums * self._means
+        return prod - row_sums[:, None] * self._means[None, :]
+
+
 class NormalizedViewBase:
     """Shared implementation for the normalized VCSC/VCSR views.
 
@@ -872,6 +947,57 @@ class NormalizedViewBase:
                 out,
             )
         return out
+
+    def copy(self) -> NormalizedViewBase:
+        """An independent view over the same base array.
+
+        The statistics are copied; the base array is **shared**, because a view
+        never mutates it and duplicating it would defeat the point of being
+        lazy -- 15+ GB on a cohort-scale dataset. This mirrors :meth:`select`,
+        which likewise returns a view sharing the base.
+
+        Present so that containers holding a view (see
+        :class:`~vsparse.VCSCAnnData`) can implement ``copy``/``to_memory``
+        without materializing. ``anndata`` calls ``to_memory()`` defensively to
+        realize disk-backed data, which for an in-memory view is a no-op.
+        """
+        return type(self).from_stats(
+            self._arr,
+            self.recipe,
+            np.array(self.a),
+            np.array(self.b),
+            np.array(self.c),
+            np.array(self.s),
+            stale=self.stale,
+        )
+
+    def to_device(self, backend: str) -> Any:
+        """This view, resident on ``backend``'s device.
+
+        ``parafac2.backend.GPUMatrix`` looks for this method on a duck-typed
+        matrix and then only ``@``-s the result, so the returned object needs
+        nothing but ``__matmul__``/``__rmatmul__``. Without it, a normalized
+        view is CPU-only: ``GPUMatrix`` raises ``TypeError`` and the caller has
+        to materialize with :meth:`to_scipy_sparse` first, which defeats the
+        point of a lazy view.
+
+        The transfer moves only the sparse ``Delta`` term and the length-
+        ``n_cols`` centering vector -- see :class:`_DeviceNormalizedView`.
+        """
+        if backend == "cpu":
+            return self
+        if backend != "cupy":
+            raise ValueError(
+                f"{type(self).__name__}.to_device supports 'cupy' and 'cpu', got {backend!r}."
+            )
+        import cupy as cp  # ty: ignore[unresolved-import]
+        import cupyx.scipy.sparse as cusp  # ty: ignore[unresolved-import]
+
+        host = self.to_scipy_sparse(dtype=np.float32)
+        delta = cusp.csr_matrix(host.tocsr() if hasattr(host, "tocsr") else host)
+        del host
+        means = cp.asarray(np.asarray(self.means), dtype=cp.float32)
+        return _DeviceNormalizedView(delta, means, self.shape, cp)
 
     def to_scipy_sparse(self, dtype: npt.DTypeLike = np.float64) -> Any:
         """The uncentered, scaled sparse ``Delta`` term, as a real scipy sparse array.
