@@ -608,14 +608,29 @@ def _compute_row_scale(arr: Any, recipe: Recipe) -> np.ndarray:
     return row_scale
 
 
-class _DeviceNormalizedView:
-    """A normalized view resident in GPU memory, for `parafac2`'s backends.
+#: Nonzeros per row block streamed to the device. 2e8 is ~1.6 GB as float32
+#: values plus int32 column indices, leaving room on a 24 GB card for the
+#: dense operands and temporaries.
+DEFAULT_CHUNK_NNZ = 200_000_000
 
-    Holds the same decomposition :attr:`NormalizedViewBase.means` documents --
-    ``view.toarray() == view.to_scipy_sparse().toarray() - view.means`` -- with
-    the sparse ``Delta`` term on the device and the centering kept as a rank-1
-    correction applied there. Nothing is ever densified: centering a matmul
-    costs one extra dense product against a length-``n_cols`` vector.
+
+class _DeviceNormalizedView:
+    """Streams a normalized view through GPU memory in row blocks.
+
+    A full-cohort device copy is not an option above ``2**31`` nonzeros:
+    CuPy's ``csr_matrix`` derives one shared index dtype from the contents, so
+    the indices widen to int64 and a 3.5e9-nonzero matrix needs 42 GB (14 GB of
+    float32 values plus 28 GB of indices) before any operand is allocated.
+
+    So nothing is uploaded up front. Each product walks the view in row blocks
+    of roughly ``chunk_nnz`` nonzeros, materializing one block at a time. Every
+    block is individually under ``2**31`` nonzeros, so its indices stay int32,
+    and device residency is bounded by the block rather than by the dataset.
+    The host never builds the full sparse term either -- the block comes
+    straight off the lazy view.
+
+    Centering stays the rank-1 correction :attr:`NormalizedViewBase.means`
+    documents, applied per block rather than materialized.
 
     ``parafac2.backend.GPUMatrix`` only ever ``@``-s what ``to_device``
     returns, so those two operators are the whole contract.
@@ -626,61 +641,101 @@ class _DeviceNormalizedView:
     # `GPUMatrix` sets this for the same reason.
     __array_priority__ = 1000
 
-    __slots__ = ("_delta", "_means", "shape", "dtype", "_xp", "_spmm")
+    __slots__ = ("_view", "_means", "shape", "dtype", "_chunk_nnz", "_blocks")
 
-    def __init__(self, delta: Any, means: Any, shape: tuple[int, int], xp: Any) -> None:
-        self._delta = delta
-        self._means = means
-        self.shape = shape
+    def __init__(self, view: Any, chunk_nnz: int = DEFAULT_CHUNK_NNZ) -> None:
+        self._view = view
+        self._means = np.asarray(view.means, dtype=np.float64)
+        self.shape = view.shape
         self.dtype = np.dtype(np.float64)
-        self._xp = xp
-        # cuSPARSE's legacy SpMM is unsafe for int64-indexed matrices, and
-        # CuPy's `@` routes there. Above 2**31 nonzeros the device copy is
-        # int64-indexed no matter what the host array carries, so prefer
-        # nvmath's SpMM when it is installed -- this is the same reason
-        # `parafac2.backend` reaches for it.
-        try:
-            import nvmath  # noqa: F401
+        self._chunk_nnz = chunk_nnz
+        self._blocks = self._plan_blocks()
 
-            self._spmm = True
-        except ImportError:
-            self._spmm = False
+    def _plan_blocks(self) -> list[tuple[int, int]]:
+        """Contiguous row ranges of roughly ``chunk_nnz`` nonzeros each."""
+        n_rows = self.shape[0]
+        if n_rows == 0:
+            return []
+        nnz = int(getattr(self._view, "nnz", self._view._arr.nnz))
+        per_row = max(1.0, nnz / n_rows)
+        rows = max(1, min(n_rows, int(self._chunk_nnz / per_row)))
+        return [(s, min(s + rows, n_rows)) for s in range(0, n_rows, rows)]
 
-    def _sparse_at_dense(self, rhs: Any) -> Any:
-        if not self._spmm:
-            return self._delta @ rhs
-        import nvmath
+    def _device_block(self, start: int, stop: int) -> Any:
+        """One row block, on device, with int32 indices and canonical flag."""
+        import cupy as cp  # ty: ignore[unresolved-import]
+        import cupyx.scipy.sparse as cusp  # ty: ignore[unresolved-import]
 
-        xp = self._xp
-        # nvmath's SpMM refuses mixed precision, so the dense operand is cast
-        # to the sparse term's dtype -- the same thing `parafac2` does before
-        # its own call (`matmul(X, Omega.astype(X_dtype))`).
-        rhs_2d = rhs[:, None] if rhs.ndim == 1 else rhs
-        rhs_2d = rhs_2d.astype(self._delta.dtype, copy=False)
-        out = xp.zeros(
-            (self._delta.shape[0], rhs_2d.shape[1]), dtype=self._delta.dtype
+        host = self._view.select(
+            slice(start, stop), slice(None), recalculate=False
+        ).to_scipy_sparse(dtype=np.float32)
+        host = host.tocsr() if hasattr(host, "tocsr") else host
+        block = cusp.csr_matrix(
+            (
+                cp.asarray(host.data),
+                cp.asarray(host.indices.astype(np.int32)),
+                cp.asarray(host.indptr.astype(np.int32)),
+            ),
+            shape=host.shape,
         )
-        res = nvmath.sparse.matmul(self._delta, rhs_2d, out)
-        return res.ravel() if rhs.ndim == 1 else res
+        # cuSPARSE rejects a non-canonical CSR rather than canonicalizing one,
+        # and a matrix rebuilt from raw index arrays carries no canonical flag.
+        # The block is canonical by construction, so this is a cheap
+        # device-side check rather than a COO round-trip.
+        block.has_canonical_format = True
+        return block
 
-    def __matmul__(self, rhs: Any) -> Any:
-        """``self @ rhs``; the centering is a rank-1 correction, not a copy."""
-        xp = self._xp
-        rhs_d = xp.asarray(rhs).astype(self._delta.dtype, copy=False)
-        prod = self._sparse_at_dense(rhs_d)
-        # V @ R == Delta @ R - 1_n (means^T R)
-        return prod - (self._means @ rhs_d)
+    def __matmul__(self, rhs: Any) -> np.ndarray:
+        """``self @ rhs``, streamed over row blocks.
 
-    def __rmatmul__(self, lhs: Any) -> Any:
-        """``lhs @ self``; likewise rank-1."""
-        xp = self._xp
-        lhs_d = xp.asarray(lhs).astype(self._delta.dtype, copy=False)
-        prod = lhs_d @ self._delta
-        # L @ V == L @ Delta - (L 1_n) means^T
-        row_sums = lhs_d.sum(axis=-1)
-        if lhs_d.ndim == 1:
-            return prod - row_sums * self._means
-        return prod - row_sums[:, None] * self._means[None, :]
+        Returns a NumPy array: ``parafac2``'s ``GPUMatrix.matmul`` documents a
+        host array as its return type, and its callers do ``np.asarray(...)``
+        on the result, which raises on a CuPy array.
+        """
+        import cupy as cp  # ty: ignore[unresolved-import]
+
+        rhs_arr = np.asarray(rhs)
+        rhs_1d = rhs_arr.ndim == 1
+        rhs_2d = rhs_arr[:, None] if rhs_1d else rhs_arr
+        rhs_d = cp.asarray(rhs_2d, dtype=cp.float32)
+        shift = cp.asarray(self._means, dtype=cp.float64) @ cp.asarray(
+            rhs_2d, dtype=cp.float64
+        )
+        out = np.empty((self.shape[0], rhs_2d.shape[1]), dtype=np.float64)
+        for start, stop in self._blocks:
+            block = self._device_block(start, stop)
+            product = cp.asarray(block @ rhs_d, dtype=cp.float64) - shift
+            out[start:stop] = cp.asnumpy(product)
+            del block, product
+        return out.ravel() if rhs_1d else out
+
+    def __rmatmul__(self, lhs: Any) -> np.ndarray:
+        """``lhs @ self``, streamed over row blocks; returns a NumPy array.
+
+        Uses cuSPARSE's ``spmm`` transpose flag rather than ``dense @ sparse``:
+        CuPy routes the latter through ``sum_duplicates``, which round-trips
+        the block through COO and allocates several times its own size.
+        """
+        import cupy as cp  # ty: ignore[unresolved-import]
+        import cupyx.cusparse  # ty: ignore[unresolved-import]
+
+        lhs_arr = np.asarray(lhs)
+        lhs_1d = lhs_arr.ndim == 1
+        lhs_2d = lhs_arr[None, :] if lhs_1d else lhs_arr
+        width = lhs_2d.shape[0]
+        total = cp.zeros((self.shape[1], width), dtype=cp.float64)
+        column_weight = cp.zeros(width, dtype=cp.float64)
+        for start, stop in self._blocks:
+            block = self._device_block(start, stop)
+            left = cp.asfortranarray(
+                cp.asarray(lhs_2d[:, start:stop].T, dtype=cp.float32)
+            )
+            total += cp.asarray(cupyx.cusparse.spmm(block, left, transa=True), dtype=cp.float64)
+            column_weight += cp.asarray(left, dtype=cp.float64).sum(axis=0)
+            del block, left
+        total -= cp.outer(cp.asarray(self._means, dtype=cp.float64), column_weight)
+        out = np.ascontiguousarray(cp.asnumpy(total).T)
+        return out.ravel() if lhs_1d else out
 
 
 class NormalizedViewBase:
@@ -990,14 +1045,7 @@ class NormalizedViewBase:
             raise ValueError(
                 f"{type(self).__name__}.to_device supports 'cupy' and 'cpu', got {backend!r}."
             )
-        import cupy as cp  # ty: ignore[unresolved-import]
-        import cupyx.scipy.sparse as cusp  # ty: ignore[unresolved-import]
-
-        host = self.to_scipy_sparse(dtype=np.float32)
-        delta = cusp.csr_matrix(host.tocsr() if hasattr(host, "tocsr") else host)
-        del host
-        means = cp.asarray(np.asarray(self.means), dtype=cp.float32)
-        return _DeviceNormalizedView(delta, means, self.shape, cp)
+        return _DeviceNormalizedView(self)
 
     def to_scipy_sparse(self, dtype: npt.DTypeLike = np.float64) -> Any:
         """The uncentered, scaled sparse ``Delta`` term, as a real scipy sparse array.
