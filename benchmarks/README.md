@@ -55,3 +55,32 @@ merge. On a 4M-nonzero array, for results of length `n_minor`:
 Write a function returning `{metric: value}` in `cases.py`, decorated with
 `@fast` (runs on every PR, keep it under a minute) or `@slow`. Add any new
 gated metric to `margins` in `baselines.json`, then `--record`.
+
+## Memory: what belongs here and what belongs in the tests
+
+Memory shows up in both places, measuring different things, and the split is
+deliberate.
+
+**The test suite owns the ceilings.** `pytest-memray` marks
+(`limit_memory`, `limit_leaks`) assert that an operation's allocation is
+bounded by its accumulator rather than by `nnz` -- a property that either
+holds or does not, with no baseline to record. `memray` intercepts the
+allocator itself, so it sees numba's allocations, including the thread-local
+accumulators inside a `parallel=True` kernel; `tracemalloc` sees those too,
+but only as Python-level allocations, and neither sees resident-set effects
+(see below). Those tests pin `numba.set_num_threads` so the expected number
+is a property of the code rather than of the runner, and build their inputs
+in fixtures, since a mark measures only the test body.
+
+**The benchmarks own the numbers.** `peak_alloc_mb` records what an operation
+allocated so a change in it is visible over time and against a baseline. It
+stays on `tracemalloc`: these run outside pytest, where the marks do not
+apply.
+
+Neither measures RSS, and so neither catches allocator *fragmentation* -- many
+variably-sized alloc/free cycles driving the resident set far above the live
+set, which is what #49 hit at ~1,150 chunks per pass. Both tools report the
+live high-water mark, which stays small throughout such a run. That failure
+mode is real but is not reliably gateable: RSS moves with the allocator, the
+runner and the thread count. Diagnose it with `/proc/self/status` `VmHWM`
+around a workload when it is suspected, rather than asserting on it in CI.

@@ -9,7 +9,6 @@ other VCS format.
 
 from __future__ import annotations
 
-import tracemalloc
 
 import numpy as np
 import pytest
@@ -93,29 +92,40 @@ def test_no_second_copy_of_the_array_is_built(vcls, rng):
     assert nv._arr is v
 
 
-def test_misaligned_matmul_peak_is_bounded_by_the_accumulator_budget(rng):
-    """Peak memory tracks the (fixed) accumulator budget, not the size of the array."""
-    dense = rng.integers(1, 5, size=(1200, 400)).astype(np.float64)
+@pytest.fixture(scope="module")
+def misaligned_setup():
+    """A 1_200 x 400 VCSC view and a width-2 operand, JIT already warmed.
+
+    In a fixture so that neither the array nor the one-off compilation counts
+    against the ceiling below -- `limit_memory` measures the test body only.
+    """
+    rng = np.random.default_rng(0)
+    dense = rng.integers(1, 5, size=(1_200, 400)).astype(np.float64)
     v = VCSCArray.from_scipy(sp.csc_array(dense))
-    nnz_bytes = v.nnz * v.indices.dtype.itemsize
     B = rng.normal(size=(dense.shape[1], 2))
+    v.normalized() @ B  # warm up the JIT
+    return v, B, dense
 
-    v.normalized() @ B  # warm up the JIT before measuring
 
-    nv = v.normalized()
-    tracemalloc.start()
-    try:
-        before = tracemalloc.get_traced_memory()[0]
-        tracemalloc.reset_peak()
-        out = nv @ B
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
+# 1_200 x 400 with no zeros is 480_000 nonzeros: 3.8 MB of values and 1.9 MB of
+# indices. The accumulator block is `MEMORY_TEST_THREADS * 1_200 * 2 * 8` =
+# 77 KB, plus the 19 KB output. A ceiling of 256 KB is ~2x that and ~15x under
+# the values array, so it fails if this path ever goes back to building a
+# second copy of the array and passes on any runner.
+@pytest.mark.limit_memory("256 KB")
+def test_misaligned_matmul_peak_is_bounded_by_the_accumulator_budget(
+    pinned_threads, misaligned_setup
+):
+    """Peak memory tracks the (fixed) accumulator budget, not the size of the array."""
+    v, B, _ = misaligned_setup
+    out = v.normalized() @ B
+    assert out.shape == (1_200, 2)
 
-    # Accumulator block is nthreads * n_rows * width * 8 bytes -- independent
-    # of nnz, so it stays far below a per-nonzero cost for this shape.
-    assert peak - before < nnz_bytes
-    np.testing.assert_allclose(out, _reference(dense) @ B, atol=1e-7)
+
+def test_misaligned_matmul_result_is_still_correct(misaligned_setup):
+    """The bounded-memory path above must also produce the right numbers."""
+    v, B, dense = misaligned_setup
+    np.testing.assert_allclose(v.normalized() @ B, _reference(dense) @ B, atol=1e-7)
 
 
 def test_accumulator_threads_degrades_to_one_for_a_huge_output_axis():
@@ -123,3 +133,20 @@ def test_accumulator_threads_degrades_to_one_for_a_huge_output_axis():
     huge_axis = 2_000_000
     wide_b = 200  # e.g. rank + oversampling in a randomized SVD
     assert accumulator_threads(huge_axis, bytes_per_element=8 * wide_b) == 1
+
+
+# `limit_leaks` fails when any single call stack still holds memory once the
+# body returns, which is the shape of a cache that grows with use rather than
+# of a big one-off allocation -- the bug d286cf3 fixed, where the normalization
+# cache pinned O(nnz) duals. `limit_memory` cannot see it: each pass on its own
+# stays under any sane ceiling, and only the accumulation across passes is
+# wrong. It traces native stacks for every allocation and so is markedly
+# slower than the ceilings above, which is why there is one of these and not
+# one per operation.
+@pytest.mark.limit_leaks("128 KB")
+def test_repeated_matmul_on_one_view_retains_nothing(pinned_threads, misaligned_setup):
+    """Iterating on a view must not accumulate: every pass frees what it took."""
+    v, B, _ = misaligned_setup
+    nv = v.normalized()
+    for _ in range(8):
+        nv @ B
