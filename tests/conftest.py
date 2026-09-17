@@ -38,16 +38,9 @@ def csr(dense) -> sp.csr_array:
     return sp.csr_array(dense)
 
 
-#: Threads the memory-limited tests run their kernels with.
-#:
-#: The thread-local accumulators those tests bound are
-#: ``nthreads * n_minor * width * 8`` bytes, so their size follows
-#: ``numba.get_num_threads()`` -- which is a property of the machine, not of
-#: the code under test. Left free, the same assertion would mean something
-#: different on a 4-core runner than on a 96-core one, and a limit loose
-#: enough for the widest machine would be too loose to catch a regression on
-#: any of them. Pinning it makes the expected allocation a number the test
-#: can actually state.
+#: Threads the memory-limited tests run their kernels with. Their accumulators
+#: are ``nthreads * n_minor * width * 8`` bytes, so an unpinned count would make
+#: the same ceiling mean something different on every machine.
 MEMORY_TEST_THREADS = 4
 
 
