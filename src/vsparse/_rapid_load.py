@@ -130,15 +130,7 @@ def _decode_selected_rows(
                 prev = np.int64(-1)
                 value = values[g]
                 for _ in range(value_ptr[g], value_ptr[g + 1]):
-                    shift = np.uint64(0)
-                    result = np.uint64(0)
-                    while True:
-                        b = packed[pos]
-                        pos += 1
-                        result |= np.uint64(b & 0x7F) << shift
-                        if b & 0x80 == 0:
-                            break
-                        shift += np.uint64(7)
+                    result, pos = _ivcsc._decode_varint(packed, pos)
                     prev = prev + 1 + np.int64(result)
                     out_indices[out_pos] = prev
                     out_data[out_pos] = value

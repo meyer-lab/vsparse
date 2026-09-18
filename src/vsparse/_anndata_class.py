@@ -70,6 +70,17 @@ def _subset_2d(v: Any, oidx: Any, vidx: Any) -> Any:
     return np.asarray(v)[oidx][:, vidx]
 
 
+def _coerce_vcs(value: Any, name: str) -> Any:
+    """Coerce a raw scipy/ndarray ``X``/``raw_X`` value to VCSC/VCSR, validating anything else."""
+    if value is not None and not isinstance(value, _VCS_TYPES):
+        if sp.issparse(value) or isinstance(value, np.ndarray):
+            vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
+            value = vcls.from_scipy(value)
+        else:
+            _check_vcs_type(value, name)
+    return value
+
+
 def _copy_value(v: Any) -> Any:
     """A deep-enough copy of one obs/var/obsm/varm/obsp/varp/layers value.
 
@@ -146,12 +157,7 @@ class VCSCAnnData(ad.AnnData):
 
     @X.setter
     def X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _VCS_TYPES):
-            if sp.issparse(value) or isinstance(value, np.ndarray):
-                vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
-                value = vcls.from_scipy(value)
-            else:
-                _check_vcs_type(value, "X")
+        value = _coerce_vcs(value, "X")
         if (
             value is not None
             and hasattr(self, "_obs")
@@ -168,13 +174,7 @@ class VCSCAnnData(ad.AnnData):
 
     @raw_X.setter
     def raw_X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _VCS_TYPES):
-            if sp.issparse(value) or isinstance(value, np.ndarray):
-                vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
-                value = vcls.from_scipy(value)
-            else:
-                _check_vcs_type(value, "raw_X")
-        self._vcs_raw_X = value
+        self._vcs_raw_X = _coerce_vcs(value, "raw_X")
 
     # -- indexing / view creation ---------------------------------------------
 
