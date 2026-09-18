@@ -95,7 +95,7 @@ def _decode_varint(buf: np.ndarray, pos: np.int64) -> tuple[np.uint64, np.int64]
 @numba.njit(cache=True)
 def _unpack(value_ptr: np.ndarray, buf: np.ndarray, out: np.ndarray) -> None:
     n_groups = value_ptr.shape[0] - 1
-    pos = 0
+    pos = np.int64(0)
     for g in range(n_groups):
         start, end = value_ptr[g], value_ptr[g + 1]
         prev = np.int64(-1)

@@ -119,7 +119,7 @@ def _decode_selected_rows(
     out_data: np.ndarray,
 ) -> None:
     """Decode only selected IVCSR rows while scanning past excluded rows."""
-    pos = 0
+    pos = np.int64(0)
     out_pos = 0
     n_rows = major_ptr.shape[0] - 1
 
@@ -547,17 +547,19 @@ def load_and_normalize(
         )
         gene_denom = n_cells
     else:
-        cell_mask, row_indptr, indices, data, metadata_cell_mask, gene_denom = _rows_with_obs_filter(
-            major_ptr,
-            values,
-            value_ptr,
-            packed,
-            indices_dtype,
-            cell_totals,
-            kwargs.get("obs"),
-            obs_filter,
-            min_cell_counts,
-            n_cells,
+        cell_mask, row_indptr, indices, data, metadata_cell_mask, gene_denom = (
+            _rows_with_obs_filter(
+                major_ptr,
+                values,
+                value_ptr,
+                packed,
+                indices_dtype,
+                cell_totals,
+                kwargs.get("obs"),
+                obs_filter,
+                min_cell_counts,
+                n_cells,
+            )
         )
     del packed
 
@@ -572,9 +574,9 @@ def load_and_normalize(
     X = csr_array((normalized, out_indices, new_indptr), shape=(kept_rows.shape[0], n_kept_genes))
 
     if "obs" in kwargs and "var" in kwargs:
-        adata = ad.AnnData(**kwargs)  # ty: ignore[invalid-argument-type]
+        adata = ad.AnnData(**kwargs)
     else:
-        adata = ad.AnnData(shape=shape, **kwargs)  # ty: ignore[invalid-argument-type]
+        adata = ad.AnnData(shape=shape, **kwargs)
     adata = adata[metadata_cell_mask, gene_mask].copy()
     adata.X = X
 

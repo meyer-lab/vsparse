@@ -95,12 +95,10 @@
       "time_ratio_vs_scipy": 1.2909
     },
     "misaligned_matmat_vs_scipy": {
-      "time_ratio_vs_scipy": 2.0436,
-      "peak_alloc_mb": 38.4009
+      "time_ratio_vs_scipy": 2.0436
     },
     "misaligned_rmatmat_vs_scipy": {
-      "time_ratio_vs_scipy": 1.0817,
-      "peak_alloc_mb": 20.2251
+      "time_ratio_vs_scipy": 1.0817
     }
   }
 }

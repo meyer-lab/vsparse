@@ -695,7 +695,15 @@ def _column_gstats(arr, row_scale, need_b, need_gstats, g_code, n_rows, n_cols):
         if not (need_b or need_gstats):
             return ones, zeros, zeros, zeros, zeros
         return _column_stats_major_is_col(
-            arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, need_b, need_gstats, g_code, n_rows
+            arr.major_ptr,
+            arr.values,
+            arr.value_ptr,
+            indices,
+            row_scale,
+            need_b,
+            need_gstats,
+            g_code,
+            n_rows,
         )
 
     gene_scale = ones

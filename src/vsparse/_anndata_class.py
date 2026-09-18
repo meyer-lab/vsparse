@@ -302,7 +302,9 @@ class VCSCAnnData(ad.AnnData):
             and len(self.varm[_VSPARSE_VARM_B]) == self.n_vars
         ):
             return None
-        nview_cls = VCSCArrayNormalized if isinstance(self._vcs_X, VCSCArray) else VCSRArrayNormalized
+        nview_cls = (
+            VCSCArrayNormalized if isinstance(self._vcs_X, VCSCArray) else VCSRArrayNormalized
+        )
         return nview_cls.from_stats(
             self._vcs_X,
             recipe,

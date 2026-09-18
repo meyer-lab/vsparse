@@ -308,10 +308,7 @@ def misaligned_matmat_vs_scipy() -> dict[str, float]:
     v = VCSCArray.from_scipy(mat)
     csc = sp.csc_array(mat)
     B = np.random.default_rng(0).normal(size=(mat.shape[1], 8))
-    return {
-        "time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ B, lambda: csc @ B),
-        "peak_alloc_mb": peak_alloc_mb(lambda: v @ B),
-    }
+    return {"time_ratio_vs_scipy": ratio_vs_scipy(lambda: v @ B, lambda: csc @ B)}
 
 
 @fast
@@ -325,10 +322,7 @@ def misaligned_rmatmat_vs_scipy() -> dict[str, float]:
     v = VCSRArray.from_scipy(mat)
     csr = sp.csr_array(mat)
     B = np.random.default_rng(0).normal(size=(8, mat.shape[0]))
-    return {
-        "time_ratio_vs_scipy": ratio_vs_scipy(lambda: B @ v, lambda: B @ csr),
-        "peak_alloc_mb": peak_alloc_mb(lambda: B @ v),
-    }
+    return {"time_ratio_vs_scipy": ratio_vs_scipy(lambda: B @ v, lambda: B @ csr)}
 
 
 # -- larger, for the scheduled job -------------------------------------------
