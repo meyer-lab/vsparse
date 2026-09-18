@@ -13,7 +13,13 @@ import scipy.sparse as sp
 
 from vsparse import _compression, _io
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
-from vsparse._norm_common import DEFAULT_RECIPE, Recipe, _NormCache, resolve_recipe
+from vsparse._norm_common import (
+    DEFAULT_RECIPE,
+    NormalizedViewBase,
+    Recipe,
+    _NormCache,
+    resolve_recipe,
+)
 from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 if TYPE_CHECKING:
@@ -23,6 +29,12 @@ if TYPE_CHECKING:
 __all__ = ["VCSCAnnData"]
 
 _VCS_TYPES = (VCSCArray, VCSRArray)
+#: Types `X` may hold. A normalized view is included because it is the whole
+#: point of `normalized()`: a lazy, `.select`-able object that streaming
+#: consumers can restrict without materializing. Excluding it forced every
+#: caller through `to_scipy_sparse()`, which materializes the entire matrix --
+#: 42 GB on a cohort-scale dataset -- purely to have somewhere to put it.
+_X_TYPES = (VCSCArray, VCSRArray, NormalizedViewBase)
 _AnyVCS = _VCSBase
 _DF_KEYS = ("obs", "var")
 _MAPPING_KEYS = ("obsm", "varm", "obsp", "varp", "layers", "uns")
@@ -56,6 +68,12 @@ def _subset_1d(v: Any, idx: Any) -> Any:
 def _subset_2d(v: Any, oidx: Any, vidx: Any) -> Any:
     if v is None:
         return None
+    if isinstance(v, NormalizedViewBase):
+        # `select(..., recalculate=False)` keeps this view's statistics instead
+        # of renormalizing the subset on its own -- the same semantics as
+        # slicing an already-normalized dense/sparse matrix, which is what a
+        # caller subsetting an AnnData expects.
+        return v.select(oidx, vidx, recalculate=False)
     if isinstance(v, _VCS_TYPES):
         result = v[oidx, vidx]
         # VCSCArray/VCSRArray.__getitem__ only converts to a plain scipy
@@ -80,11 +98,18 @@ def _copy_value(v: Any) -> Any:
     return None if v is None else v.copy()
 
 
-def _check_vcs_type(value: Any, name: str) -> None:
-    if value is not None and not isinstance(value, _VCS_TYPES):
+def _check_vcs_type(value: Any, name: str, allowed: tuple[type, ...] = _VCS_TYPES) -> None:
+    """Reject anything that is not a stored array, or (for ``X``) a view of one.
+
+    ``raw_X`` keeps the narrower set: it holds the raw counts by definition, so
+    a normalized view is not a thing it can meaningfully be.
+    """
+    if value is not None and not isinstance(value, allowed):
+        extra = ", or a normalized view of one" if NormalizedViewBase in allowed else ""
+        build = ", or .normalized(...)" if NormalizedViewBase in allowed else ""
         raise TypeError(
-            f"{name} must be a VCSCArray or VCSRArray, got {type(value).__name__}. "
-            f"Build one with VCSCArray.from_scipy(...) or vsparse.from_anndata(...)."
+            f"{name} must be a VCSCArray or VCSRArray{extra}, got {type(value).__name__}. "
+            f"Build one with VCSCArray.from_scipy(...) or vsparse.from_anndata(...){build}."
         )
 
 
@@ -120,7 +145,7 @@ class VCSCAnnData(ad.AnnData):
         raw_X: _AnyVCS | None = None,
         **kwargs: Any,
     ) -> None:
-        _check_vcs_type(X, "X")
+        _check_vcs_type(X, "X", _X_TYPES)
         _check_vcs_type(raw_X, "raw_X")
         if "raw" in kwargs:
             raise TypeError(
@@ -146,12 +171,12 @@ class VCSCAnnData(ad.AnnData):
 
     @X.setter
     def X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _VCS_TYPES):
+        if value is not None and not isinstance(value, _X_TYPES):
             if sp.issparse(value) or isinstance(value, np.ndarray):
                 vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
                 value = vcls.from_scipy(value)
             else:
-                _check_vcs_type(value, "X")
+                _check_vcs_type(value, "X", _X_TYPES)
         if (
             value is not None
             and hasattr(self, "_obs")

@@ -608,6 +608,150 @@ def _compute_row_scale(arr: Any, recipe: Recipe) -> np.ndarray:
     return row_scale
 
 
+#: Nonzeros per row block streamed to the device. 2e8 is ~1.6 GB as float32
+#: values plus int32 column indices, leaving room on a 24 GB card for the
+#: dense operands and temporaries.
+DEFAULT_CHUNK_NNZ = 200_000_000
+
+
+class _DeviceNormalizedView:
+    """A normalized view streamed through GPU memory in row blocks.
+
+    Supports ``@`` and ``r@`` only, which is the whole contract
+    ``parafac2.backend.GPUMatrix`` asks of a duck-typed matrix. Nothing is
+    uploaded up front: each product walks the view a block of roughly
+    ``chunk_nnz`` nonzeros at a time, so device residency is bounded by the
+    block rather than by the dataset. Centering stays the rank-1 correction
+    :attr:`NormalizedViewBase.means` documents, applied per block.
+    """
+
+    # NumPy/CuPy would otherwise try to broadcast this object elementwise on
+    # `lhs @ view` instead of deferring to `__rmatmul__`. `parafac2`'s own
+    # `GPUMatrix` sets this for the same reason.
+    __array_priority__ = 1000
+
+    __slots__ = (
+        "_blocks",
+        "_cache",
+        "_cache_host",
+        "_chunk_nnz",
+        "_means",
+        "_view",
+        "dtype",
+        "shape",
+    )
+
+    def __init__(
+        self,
+        view: Any,
+        chunk_nnz: int = DEFAULT_CHUNK_NNZ,
+        cache_host: bool = True,
+    ) -> None:
+        self._view = view
+        self._means = np.asarray(view.means, dtype=np.float64)
+        self.shape = view.shape
+        self.dtype = np.dtype(np.float64)
+        self._chunk_nnz = chunk_nnz
+        self._blocks = self._plan_blocks()
+        # Decoding off the packed view is the expensive part, and a
+        # compression makes several raw-data passes, so cache the host blocks
+        # and pay it once.
+        self._cache_host = cache_host
+        self._cache: dict[tuple[int, int], Any] = {}
+
+    def _plan_blocks(self) -> list[tuple[int, int]]:
+        """Contiguous row ranges of roughly ``chunk_nnz`` nonzeros each."""
+        n_rows = self.shape[0]
+        if n_rows == 0:
+            return []
+        nnz = int(getattr(self._view, "nnz", self._view._arr.nnz))
+        per_row = max(1.0, nnz / n_rows)
+        rows = max(1, min(n_rows, int(self._chunk_nnz / per_row)))
+        return [(s, min(s + rows, n_rows)) for s in range(0, n_rows, rows)]
+
+    def _host_block(self, start: int, stop: int) -> Any:
+        """One row block as a host CSR with int32 indices, decoded once."""
+        key = (start, stop)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        host = self._view.select(
+            slice(start, stop), slice(None), recalculate=False
+        ).to_scipy_sparse(dtype=np.float32)
+        host = host.tocsr() if hasattr(host, "tocsr") else host
+        # Under 2**31 nonzeros by construction, so the indices stay int32
+        # even where the whole matrix would force scipy/CuPy to int64 and
+        # double what the column indices cost.
+        host.indices = host.indices.astype(np.int32, copy=False)
+        host.indptr = host.indptr.astype(np.int32, copy=False)
+        if self._cache_host:
+            self._cache[key] = host
+        return host
+
+    def _device_block(self, start: int, stop: int) -> Any:
+        """One row block, on device, with int32 indices and canonical flag."""
+        import cupy as cp  # ty: ignore[unresolved-import]
+        import cupyx.scipy.sparse as cusp  # ty: ignore[unresolved-import]
+
+        host = self._host_block(start, stop)
+        block = cusp.csr_matrix(
+            (cp.asarray(host.data), cp.asarray(host.indices), cp.asarray(host.indptr)),
+            shape=host.shape,
+        )
+        # cuSPARSE rejects a non-canonical CSR rather than canonicalizing one,
+        # and a matrix rebuilt from raw index arrays carries no canonical flag.
+        # The block is canonical by construction, so this is a cheap
+        # device-side check rather than a COO round-trip.
+        block.has_canonical_format = True
+        return block
+
+    def __matmul__(self, rhs: Any) -> np.ndarray:
+        """``self @ rhs``, streamed over row blocks, as a NumPy array.
+
+        Host-side because ``parafac2``'s callers do ``np.asarray`` on the
+        result, which raises on a CuPy array.
+        """
+        import cupy as cp  # ty: ignore[unresolved-import]
+
+        rhs_arr = np.asarray(rhs)
+        rhs_1d = rhs_arr.ndim == 1
+        rhs_2d = rhs_arr[:, None] if rhs_1d else rhs_arr
+        rhs_d = cp.asarray(rhs_2d, dtype=cp.float32)
+        shift = cp.asarray(self._means, dtype=cp.float64) @ cp.asarray(rhs_2d, dtype=cp.float64)
+        out = np.empty((self.shape[0], rhs_2d.shape[1]), dtype=np.float64)
+        for start, stop in self._blocks:
+            block = self._device_block(start, stop)
+            product = cp.asarray(block @ rhs_d, dtype=cp.float64) - shift
+            out[start:stop] = cp.asnumpy(product)
+            del block, product
+        return out.ravel() if rhs_1d else out
+
+    def __rmatmul__(self, lhs: Any) -> np.ndarray:
+        """``lhs @ self``, streamed over row blocks, as a NumPy array."""
+        import cupy as cp  # ty: ignore[unresolved-import]
+        import cupyx.cusparse  # ty: ignore[unresolved-import]
+
+        lhs_arr = np.asarray(lhs)
+        lhs_1d = lhs_arr.ndim == 1
+        lhs_2d = lhs_arr[None, :] if lhs_1d else lhs_arr
+        width = lhs_2d.shape[0]
+        total = cp.zeros((self.shape[1], width), dtype=cp.float64)
+        column_weight = cp.zeros(width, dtype=cp.float64)
+        for start, stop in self._blocks:
+            block = self._device_block(start, stop)
+            # `spmm` with the transpose flag, not `dense @ sparse`: CuPy routes
+            # the latter through `sum_duplicates`, round-tripping the block
+            # through COO and allocating several times its size. It wants an
+            # F-contiguous operand.
+            left = cp.asfortranarray(cp.asarray(lhs_2d[:, start:stop].T, dtype=cp.float32))
+            total += cp.asarray(cupyx.cusparse.spmm(block, left, transa=True), dtype=cp.float64)
+            column_weight += cp.asarray(left, dtype=cp.float64).sum(axis=0)
+            del block, left
+        total -= cp.outer(cp.asarray(self._means, dtype=cp.float64), column_weight)
+        out = np.ascontiguousarray(cp.asnumpy(total).T)
+        return out.ravel() if lhs_1d else out
+
+
 class NormalizedViewBase:
     """Shared implementation for the normalized VCSC/VCSR views.
 
@@ -872,6 +1016,44 @@ class NormalizedViewBase:
                 out,
             )
         return out
+
+    def copy(self) -> NormalizedViewBase:
+        """An independent view over the same base array.
+
+        The statistics are copied; the base array is **shared**, because a view
+        never mutates it and duplicating it would defeat the point of being
+        lazy -- 15+ GB on a cohort-scale dataset. This mirrors :meth:`select`,
+        which likewise returns a view sharing the base.
+
+        Present so that containers holding a view (see
+        :class:`~vsparse.VCSCAnnData`) can implement ``copy``/``to_memory``
+        without materializing. ``anndata`` calls ``to_memory()`` defensively to
+        realize disk-backed data, which for an in-memory view is a no-op.
+        """
+        return type(self).from_stats(
+            self._arr,
+            self.recipe,
+            np.array(self.a),
+            np.array(self.b),
+            np.array(self.c),
+            np.array(self.s),
+            stale=self.stale,
+        )
+
+    def to_device(self, backend: str) -> Any:
+        """This view, resident on ``backend``'s device.
+
+        ``backend`` is ``"cpu"``, which returns ``self``, or ``"cuda"``. Only
+        the sparse ``Delta`` term and the length-``n_cols`` centering vector
+        move -- see :class:`_DeviceNormalizedView`.
+        """
+        if backend == "cpu":
+            return self
+        if backend != "cupy":
+            raise ValueError(
+                f"{type(self).__name__}.to_device supports 'cupy' and 'cpu', got {backend!r}."
+            )
+        return _DeviceNormalizedView(self)
 
     def to_scipy_sparse(self, dtype: npt.DTypeLike = np.float64) -> Any:
         """The uncentered, scaled sparse ``Delta`` term, as a real scipy sparse array.
