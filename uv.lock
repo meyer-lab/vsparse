@@ -1496,7 +1496,7 @@ wheels = [
 
 [[package]]
 name = "vsparse"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "anndata" },
@@ -1516,8 +1516,8 @@ docs = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "hypothesis" },
     { name = "codespell" },
+    { name = "hypothesis" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -1540,8 +1540,8 @@ provides-extras = ["docs"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "hypothesis", specifier = ">=6.100" },
     { name = "codespell", specifier = ">=2.3" },
+    { name = "hypothesis", specifier = ">=6.100" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-cov", specifier = ">=5.0" },
     { name = "ruff", specifier = ">=0.6" },
