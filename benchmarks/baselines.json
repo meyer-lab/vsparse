@@ -5,7 +5,7 @@
     "indices_bytes_per_nonzero": 1.1,
     "vs_scipy_ratio": 1.1,
     "peak_alloc_mb": 2.0,
-    "time_ratio_vs_scipy": 4.0,
+    "time_ratio_vs_scipy": 10.0,
     "peak_alloc_mb_view": 2.0,
     "time_ratio_view_over_materialize": 4.0,
     "cpu_ratio_1t_cp10k_log1p": 1.5,
@@ -27,10 +27,10 @@
       "peak_alloc_mb": 407.2383
     },
     "matvec_vs_scipy": {
-      "time_ratio_vs_scipy": 1.0
+      "time_ratio_vs_scipy": 2.5
     },
     "matmat_vs_scipy": {
-      "time_ratio_vs_scipy": 1.0
+      "time_ratio_vs_scipy": 2.5
     },
     "minor_extrema_peak_mb": {
       "peak_alloc_mb": 132.5453

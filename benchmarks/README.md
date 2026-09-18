@@ -25,8 +25,9 @@ building its input.
 
 **Throughput relative to scipy**, never absolute seconds. The same work is
 timed through scipy in the same process and the ratio recorded, which cancels
-most of the difference between machines. Still the noisiest metric, so its
-gate is much looser.
+most of the difference between machines. It does not cancel all of it -- a
+shared CI runner has measured 5x what a workstation does on the same commit --
+so this is much the noisiest metric and its gate is correspondingly loose.
 
 Each case runs in its own subprocess, since measurement state and JIT warm-up
 leak between them otherwise.
