@@ -679,6 +679,61 @@ def _is_constant_column(variance: np.ndarray, mean: np.ndarray, n_rows: int) -> 
     return variance <= n_rows * eps * variance + (n_rows * mean * eps) ** 2
 
 
+def _column_gstats(arr, row_scale, need_b, need_gstats, g_code, n_rows, n_cols):
+    """``gene_scale`` plus the stored-only sum/m2/corr/nnz feeding :func:`_finish_variance`.
+
+    Dispatches on ``arr._format``: VCSC fuses both statistics into one pass
+    per column (see :func:`_column_stats_major_is_col`); VCSR needs two
+    genuinely separate passes, since a column's ``gene_scale`` isn't final
+    until every row has scattered into it.
+    """
+    indices = arr.indices  # decode once; shared by both statistics passes below
+    zeros = np.zeros(n_cols, dtype=np.float64)
+    ones = np.ones(n_cols, dtype=np.float64)
+
+    if arr._format == "csc":
+        if not (need_b or need_gstats):
+            return ones, zeros, zeros, zeros, zeros
+        return _column_stats_major_is_col(
+            arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, need_b, need_gstats, g_code, n_rows
+        )
+
+    gene_scale = ones
+    if need_b:
+        nthreads = numba.get_num_threads()
+        gene_scale = _scaled_col_sums_vcs(
+            arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, n_cols, nthreads
+        )
+    if not need_gstats:
+        return gene_scale, zeros, zeros, zeros, zeros
+
+    nthreads = numba.get_num_threads()
+    kernel_args = (arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, gene_scale, g_code)
+    col_sum, col_nnz = _gstats_col_sums_vcs(*kernel_args, n_cols, nthreads)
+    col_m2, col_corr = _gstats_col_deviations_vcs(
+        *kernel_args, col_sum / n_rows if n_rows > 0 else zeros, n_cols, nthreads
+    )
+    return gene_scale, col_sum, col_m2, col_corr, col_nnz
+
+
+def _column_mean_scale(recipe, col_sum, col_m2, col_corr, col_nnz, n_rows, n_cols, *, need_gstats):
+    """Per-column ``col_mean``/``col_post_scale``, or the recipe's no-op defaults."""
+    zeros = np.zeros(n_cols, dtype=np.float64)
+    ones = np.ones(n_cols, dtype=np.float64)
+    if not need_gstats:
+        return zeros, ones
+
+    mean, variance = _finish_variance(col_sum, col_m2, col_corr, col_nnz, n_rows)
+    col_mean = mean if recipe.center else zeros
+    if not recipe.post_scale:
+        return col_mean, ones
+
+    std = np.sqrt(variance)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        col_post_scale = np.where(_is_constant_column(variance, mean, n_rows), 1.0, 1.0 / std)
+    return col_mean, col_post_scale
+
+
 class NormalizedViewBase:
     """Shared implementation for the normalized VCSC/VCSR views.
 
@@ -722,76 +777,15 @@ class NormalizedViewBase:
         row_scale = _compute_row_scale(arr, self.recipe)
         self.row_scale = row_scale
 
-        indices = arr.indices  # decode once; shared by both statistics passes below
         need_b = self.recipe.gene_scale
         need_gstats = self.recipe.center or self.recipe.post_scale
-
-        if self._format == "csc":
-            # One fused pass per column for both -- see _column_stats_major_is_col.
-            if need_b or need_gstats:
-                gene_scale, col_sum, col_m2, col_corr, col_nnz = _column_stats_major_is_col(
-                    arr.major_ptr,
-                    arr.values,
-                    arr.value_ptr,
-                    indices,
-                    row_scale,
-                    need_b,
-                    need_gstats,
-                    self.recipe.g_code,
-                    n_rows,
-                )
-            else:
-                gene_scale = np.ones(n_cols, dtype=np.float64)
-                col_sum = col_m2 = col_corr = col_nnz = np.zeros(n_cols, dtype=np.float64)
-        else:
-            # VCSR can't fuse these: gene_scale[c] isn't final until every row
-            # has been scattered into it, so the g-transform pass has to wait
-            # for the whole first pass to finish -- two genuinely separate passes.
-            if need_b:
-                nthreads = numba.get_num_threads()
-                gene_scale = _scaled_col_sums_vcs(
-                    arr.major_ptr, arr.values, arr.value_ptr, indices, row_scale, n_cols, nthreads
-                )
-            else:
-                gene_scale = np.ones(n_cols, dtype=np.float64)
-            if need_gstats:
-                nthreads = numba.get_num_threads()
-                kernel_args = (
-                    arr.major_ptr,
-                    arr.values,
-                    arr.value_ptr,
-                    indices,
-                    row_scale,
-                    gene_scale,
-                    self.recipe.g_code,
-                )
-                col_sum, col_nnz = _gstats_col_sums_vcs(*kernel_args, n_cols, nthreads)
-                col_m2, col_corr = _gstats_col_deviations_vcs(
-                    *kernel_args,
-                    col_sum / n_rows if n_rows > 0 else np.zeros(n_cols, dtype=np.float64),
-                    n_cols,
-                    nthreads,
-                )
-            else:
-                col_sum = col_m2 = col_corr = col_nnz = np.zeros(n_cols, dtype=np.float64)
+        gene_scale, col_sum, col_m2, col_corr, col_nnz = _column_gstats(
+            arr, row_scale, need_b, need_gstats, self.recipe.g_code, n_rows, n_cols
+        )
         self.gene_scale = gene_scale
-
-        if need_gstats:
-            mean, variance = _finish_variance(col_sum, col_m2, col_corr, col_nnz, n_rows)
-            std = np.sqrt(variance)
-            col_mean = mean if self.recipe.center else np.zeros(n_cols, dtype=np.float64)
-            if self.recipe.post_scale:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    col_post_scale = np.where(
-                        _is_constant_column(variance, mean, n_rows), 1.0, 1.0 / std
-                    )
-            else:
-                col_post_scale = np.ones(n_cols, dtype=np.float64)
-        else:
-            col_mean = np.zeros(n_cols, dtype=np.float64)
-            col_post_scale = np.ones(n_cols, dtype=np.float64)
-        self.col_mean = col_mean
-        self.col_post_scale = col_post_scale
+        self.col_mean, self.col_post_scale = _column_mean_scale(
+            self.recipe, col_sum, col_m2, col_corr, col_nnz, n_rows, n_cols, need_gstats=need_gstats
+        )
 
     @classmethod
     def from_stats(
