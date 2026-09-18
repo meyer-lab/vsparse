@@ -876,6 +876,11 @@ class NormalizedViewBase:
     def to_scipy_sparse(self, dtype: npt.DTypeLike = np.float64) -> Any:
         """The uncentered, scaled sparse ``Delta`` term, as a real scipy sparse array.
 
+        **Not the normalized matrix when the recipe centers.** It omits
+        :attr:`means`, the value every structural zero carries once centered;
+        ``parafac2``, ``scanpy`` and ``pearson`` all center. The whole matrix
+        is ``to_scipy_sparse().toarray() - means``, or :meth:`toarray`.
+
         Same sparsity pattern as the underlying raw array (a ``csr_array``
         for a VCSR-backed view, ``csc_array`` for VCSC), with :attr:`means`
         left to subtract externally -- see :attr:`means`. Useful for handing

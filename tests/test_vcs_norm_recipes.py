@@ -356,3 +356,21 @@ def test_anndata_cache_does_not_pin_a_dropped_view():
     assert ref() is None
     # Still reusable -- from obs/varm/uns if not from the retained statistics.
     assert adata.normalized("scanpy", recalculate=False) is not None
+
+
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+def test_to_scipy_sparse_minus_means_is_the_normalized_matrix(vcls, dense, recipe):
+    """``to_scipy_sparse() - means`` must reconstruct the normalized matrix."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized(recipe)
+    np.testing.assert_allclose(nv.to_scipy_sparse().toarray() - nv.means, nv.toarray(), atol=1e-10)
+
+
+@pytest.mark.parametrize("recipe", ["parafac2", "scanpy", "pearson"])
+def test_to_scipy_sparse_alone_is_not_the_normalized_matrix_when_centering(vcls, recipe):
+    """Dropping ``means`` really does change the answer for a centering recipe."""
+    rng = np.random.default_rng(0)
+    dense = rng.integers(1, 50, size=(40, 6)).astype(np.float64)
+    nv = vcls.from_scipy(_scipy_for(vcls, dense)).normalized(recipe)
+    assert np.abs(nv.to_scipy_sparse().toarray() - nv.toarray()).max() > 0.1
