@@ -15,7 +15,7 @@ import pytest
 import scipy.sparse as sp
 
 from vsparse import RECIPES, Recipe, VCSCAnnData, VCSCArray, VCSRArray
-from vsparse._norm_common import NORM_CACHE_MAXSIZE
+from vsparse._norm_common import NORM_CACHE_MAXSIZE, _is_constant_column
 
 
 @pytest.fixture(params=[VCSCArray, VCSRArray])
@@ -66,12 +66,13 @@ def _reference(dense: np.ndarray, recipe: str) -> np.ndarray:
     if recipe in ("scanpy", "pearson"):
         std = g.std(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            # A column with no real variance leaves only rounding noise in
-            # `std`; dividing by it amplifies noise instead of scaling. Judge
-            # "no variance" relative to the column's own magnitude, as
-            # `_zero_variance_tol` does in the library.
-            tol = np.sqrt(dense.shape[0] * np.finfo(np.float64).eps) * np.abs(g.mean(axis=0))
-            s = np.where(std > tol, 1.0 / std, 1.0)
+            # Constant columns have no unit-variance scaling; same bound as
+            # the library's `_is_constant_column`, over numpy's own std.
+            eps = np.finfo(np.float64).eps
+            n = dense.shape[0]
+            var = std**2
+            constant = var <= n * eps * var + (n * g.mean(axis=0) * eps) ** 2
+            s = np.where(constant, 1.0, 1.0 / std)
     else:
         s = np.ones(dense.shape[1])
 
@@ -367,16 +368,7 @@ def test_anndata_cache_does_not_pin_a_dropped_view():
 @pytest.mark.parametrize("value", [1.0, 7.0, 9999.0])
 @pytest.mark.parametrize("recipe", ["scanpy", "pearson"])
 def test_a_column_with_no_variance_centers_to_zero(vcls, n_rows, value, recipe):
-    """A constant column has no variance to scale by, so centering must leave 0.
-
-    ``variance`` is computed one-pass as ``E[x^2] - E[x]^2``, which for such a
-    column cancels to rounding noise rather than to exactly 0. Testing
-    ``std > 0`` would therefore take the dividing branch and amplify that noise
-    into an arbitrary O(1) value -- 1.05e-08 for the 6x1 case below, against
-    the 0 the same input gives at 5 rows. The scale of the noise moves with
-    the column's magnitude and with how many terms were summed, so the
-    threshold has to move with both.
-    """
+    """Depth normalization flattens a one-column matrix, so centering leaves 0."""
     dense = np.full((n_rows, 1), value)
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     out = v.normalized(recipe).toarray()
@@ -392,3 +384,30 @@ def test_a_constant_column_does_not_suppress_its_neighbours(vcls):
     out = v.normalized("pearson").toarray()
     varying = np.delete(out, 2, axis=1)
     assert np.abs(varying).max() > 0.5
+
+
+@pytest.mark.parametrize("n_rows", [6, 10_000, 1_300_000])
+def test_small_but_real_variance_is_not_called_constant(n_rows):
+    """A coefficient of variation of 1e-06 is signal, not noise, at any scale here."""
+    mean = np.array([9.21])
+    std = 1e-6 * mean[0]
+    assert not _is_constant_column(np.array([std**2]), mean, n_rows)[0]
+
+
+@pytest.mark.parametrize("n_rows", [6, 10_000, 1_300_000])
+def test_constant_detection_still_catches_a_flat_column(n_rows):
+    """Variance down at the arithmetic's own noise floor is treated as zero."""
+    mean = np.array([9.21])
+    noise = n_rows * np.finfo(np.float64).eps * mean[0]
+    assert _is_constant_column(np.array([(noise * 0.1) ** 2]), mean, n_rows)[0]
+
+
+def test_both_layouts_compute_the_same_variance(dense):
+    """Both layouts must produce the same statistics."""
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    for recipe in ("scanpy", "pearson", "parafac2"):
+        r = VCSRArray.from_scipy(sp.csr_array(dense)).normalized(recipe)
+        c = VCSCArray.from_scipy(sp.csc_array(dense)).normalized(recipe)
+        np.testing.assert_allclose(r.col_post_scale, c.col_post_scale, rtol=1e-12)
+        np.testing.assert_allclose(r.col_mean, c.col_mean, rtol=1e-12, atol=1e-15)
