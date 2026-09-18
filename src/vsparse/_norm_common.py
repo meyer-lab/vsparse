@@ -642,14 +642,14 @@ class _DeviceNormalizedView:
     __array_priority__ = 1000
 
     __slots__ = (
-        "_view",
-        "_means",
-        "shape",
-        "dtype",
-        "_chunk_nnz",
         "_blocks",
         "_cache",
         "_cache_host",
+        "_chunk_nnz",
+        "_means",
+        "_view",
+        "dtype",
+        "shape",
     )
 
     def __init__(
@@ -732,9 +732,7 @@ class _DeviceNormalizedView:
         rhs_1d = rhs_arr.ndim == 1
         rhs_2d = rhs_arr[:, None] if rhs_1d else rhs_arr
         rhs_d = cp.asarray(rhs_2d, dtype=cp.float32)
-        shift = cp.asarray(self._means, dtype=cp.float64) @ cp.asarray(
-            rhs_2d, dtype=cp.float64
-        )
+        shift = cp.asarray(self._means, dtype=cp.float64) @ cp.asarray(rhs_2d, dtype=cp.float64)
         out = np.empty((self.shape[0], rhs_2d.shape[1]), dtype=np.float64)
         for start, stop in self._blocks:
             block = self._device_block(start, stop)
@@ -761,9 +759,7 @@ class _DeviceNormalizedView:
         column_weight = cp.zeros(width, dtype=cp.float64)
         for start, stop in self._blocks:
             block = self._device_block(start, stop)
-            left = cp.asfortranarray(
-                cp.asarray(lhs_2d[:, start:stop].T, dtype=cp.float32)
-            )
+            left = cp.asfortranarray(cp.asarray(lhs_2d[:, start:stop].T, dtype=cp.float32))
             total += cp.asarray(cupyx.cusparse.spmm(block, left, transa=True), dtype=cp.float64)
             column_weight += cp.asarray(left, dtype=cp.float64).sum(axis=0)
             del block, left
