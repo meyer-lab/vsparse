@@ -98,12 +98,18 @@ def _copy_value(v: Any) -> Any:
     return None if v is None else v.copy()
 
 
-def _check_vcs_type(value: Any, name: str) -> None:
-    if value is not None and not isinstance(value, _X_TYPES):
+def _check_vcs_type(value: Any, name: str, allowed: tuple[type, ...] = _VCS_TYPES) -> None:
+    """Reject anything that is not a stored array, or (for ``X``) a view of one.
+
+    ``raw_X`` keeps the narrower set: it holds the raw counts by definition, so
+    a normalized view is not a thing it can meaningfully be.
+    """
+    if value is not None and not isinstance(value, allowed):
+        extra = ", or a normalized view of one" if NormalizedViewBase in allowed else ""
+        build = ", or .normalized(...)" if NormalizedViewBase in allowed else ""
         raise TypeError(
-            f"{name} must be a VCSCArray, VCSRArray, or a normalized view of one, "
-            f"got {type(value).__name__}. Build one with VCSCArray.from_scipy(...), "
-            f"vsparse.from_anndata(...), or .normalized(...)."
+            f"{name} must be a VCSCArray or VCSRArray{extra}, got {type(value).__name__}. "
+            f"Build one with VCSCArray.from_scipy(...) or vsparse.from_anndata(...){build}."
         )
 
 
@@ -139,7 +145,7 @@ class VCSCAnnData(ad.AnnData):
         raw_X: _AnyVCS | None = None,
         **kwargs: Any,
     ) -> None:
-        _check_vcs_type(X, "X")
+        _check_vcs_type(X, "X", _X_TYPES)
         _check_vcs_type(raw_X, "raw_X")
         if "raw" in kwargs:
             raise TypeError(
@@ -170,7 +176,7 @@ class VCSCAnnData(ad.AnnData):
                 vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
                 value = vcls.from_scipy(value)
             else:
-                _check_vcs_type(value, "X")
+                _check_vcs_type(value, "X", _X_TYPES)
         if (
             value is not None
             and hasattr(self, "_obs")
@@ -187,7 +193,7 @@ class VCSCAnnData(ad.AnnData):
 
     @raw_X.setter
     def raw_X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _X_TYPES):
+        if value is not None and not isinstance(value, _VCS_TYPES):
             if sp.issparse(value) or isinstance(value, np.ndarray):
                 vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
                 value = vcls.from_scipy(value)

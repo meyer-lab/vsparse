@@ -615,25 +615,14 @@ DEFAULT_CHUNK_NNZ = 200_000_000
 
 
 class _DeviceNormalizedView:
-    """Streams a normalized view through GPU memory in row blocks.
+    """A normalized view streamed through GPU memory in row blocks.
 
-    A full-cohort device copy is not an option above ``2**31`` nonzeros:
-    CuPy's ``csr_matrix`` derives one shared index dtype from the contents, so
-    the indices widen to int64 and a 3.5e9-nonzero matrix needs 42 GB (14 GB of
-    float32 values plus 28 GB of indices) before any operand is allocated.
-
-    So nothing is uploaded up front. Each product walks the view in row blocks
-    of roughly ``chunk_nnz`` nonzeros, materializing one block at a time. Every
-    block is individually under ``2**31`` nonzeros, so its indices stay int32,
-    and device residency is bounded by the block rather than by the dataset.
-    The host never builds the full sparse term either -- the block comes
-    straight off the lazy view.
-
-    Centering stays the rank-1 correction :attr:`NormalizedViewBase.means`
-    documents, applied per block rather than materialized.
-
-    ``parafac2.backend.GPUMatrix`` only ever ``@``-s what ``to_device``
-    returns, so those two operators are the whole contract.
+    Supports ``@`` and ``r@`` only, which is the whole contract
+    ``parafac2.backend.GPUMatrix`` asks of a duck-typed matrix. Nothing is
+    uploaded up front: each product walks the view a block of roughly
+    ``chunk_nnz`` nonzeros at a time, so device residency is bounded by the
+    block rather than by the dataset. Centering stays the rank-1 correction
+    :attr:`NormalizedViewBase.means` documents, applied per block.
     """
 
     # NumPy/CuPy would otherwise try to broadcast this object elementwise on
@@ -664,13 +653,9 @@ class _DeviceNormalizedView:
         self.dtype = np.dtype(np.float64)
         self._chunk_nnz = chunk_nnz
         self._blocks = self._plan_blocks()
-        # Decoding a block off the packed view is the expensive part, and a
-        # compression makes several raw-data passes, so without a cache every
-        # pass re-decodes the whole matrix. Caching the *host* blocks pays the
-        # decode once, like slicing a materialized CSR does -- but each block
-        # is under 2**31 nonzeros, so its indices stay int32 and the cache
-        # costs about a third less than the single int64 matrix that slicing
-        # would have required (28.2 GB vs 42.3 GB on the IBDverse cohort).
+        # Decoding off the packed view is the expensive part, and a
+        # compression makes several raw-data passes, so cache the host blocks
+        # and pay it once.
         self._cache_host = cache_host
         self._cache: dict[tuple[int, int], Any] = {}
 
@@ -694,8 +679,9 @@ class _DeviceNormalizedView:
             slice(start, stop), slice(None), recalculate=False
         ).to_scipy_sparse(dtype=np.float32)
         host = host.tocsr() if hasattr(host, "tocsr") else host
-        # A block is under 2**31 nonzeros by construction, so it keeps int32
-        # indices even where the parent matrix cannot.
+        # Under 2**31 nonzeros by construction, so the indices stay int32
+        # even where the whole matrix would force scipy/CuPy to int64 and
+        # double what the column indices cost.
         host.indices = host.indices.astype(np.int32, copy=False)
         host.indptr = host.indptr.astype(np.int32, copy=False)
         if self._cache_host:
@@ -720,11 +706,10 @@ class _DeviceNormalizedView:
         return block
 
     def __matmul__(self, rhs: Any) -> np.ndarray:
-        """``self @ rhs``, streamed over row blocks.
+        """``self @ rhs``, streamed over row blocks, as a NumPy array.
 
-        Returns a NumPy array: ``parafac2``'s ``GPUMatrix.matmul`` documents a
-        host array as its return type, and its callers do ``np.asarray(...)``
-        on the result, which raises on a CuPy array.
+        Host-side because ``parafac2``'s callers do ``np.asarray`` on the
+        result, which raises on a CuPy array.
         """
         import cupy as cp  # ty: ignore[unresolved-import]
 
@@ -742,12 +727,7 @@ class _DeviceNormalizedView:
         return out.ravel() if rhs_1d else out
 
     def __rmatmul__(self, lhs: Any) -> np.ndarray:
-        """``lhs @ self``, streamed over row blocks; returns a NumPy array.
-
-        Uses cuSPARSE's ``spmm`` transpose flag rather than ``dense @ sparse``:
-        CuPy routes the latter through ``sum_duplicates``, which round-trips
-        the block through COO and allocates several times its own size.
-        """
+        """``lhs @ self``, streamed over row blocks, as a NumPy array."""
         import cupy as cp  # ty: ignore[unresolved-import]
         import cupyx.cusparse  # ty: ignore[unresolved-import]
 
@@ -759,6 +739,10 @@ class _DeviceNormalizedView:
         column_weight = cp.zeros(width, dtype=cp.float64)
         for start, stop in self._blocks:
             block = self._device_block(start, stop)
+            # `spmm` with the transpose flag, not `dense @ sparse`: CuPy routes
+            # the latter through `sum_duplicates`, round-tripping the block
+            # through COO and allocating several times its size. It wants an
+            # F-contiguous operand.
             left = cp.asfortranarray(cp.asarray(lhs_2d[:, start:stop].T, dtype=cp.float32))
             total += cp.asarray(cupyx.cusparse.spmm(block, left, transa=True), dtype=cp.float64)
             column_weight += cp.asarray(left, dtype=cp.float64).sum(axis=0)
@@ -1059,15 +1043,9 @@ class NormalizedViewBase:
     def to_device(self, backend: str) -> Any:
         """This view, resident on ``backend``'s device.
 
-        ``parafac2.backend.GPUMatrix`` looks for this method on a duck-typed
-        matrix and then only ``@``-s the result, so the returned object needs
-        nothing but ``__matmul__``/``__rmatmul__``. Without it, a normalized
-        view is CPU-only: ``GPUMatrix`` raises ``TypeError`` and the caller has
-        to materialize with :meth:`to_scipy_sparse` first, which defeats the
-        point of a lazy view.
-
-        The transfer moves only the sparse ``Delta`` term and the length-
-        ``n_cols`` centering vector -- see :class:`_DeviceNormalizedView`.
+        ``backend`` is ``"cpu"``, which returns ``self``, or ``"cuda"``. Only
+        the sparse ``Delta`` term and the length-``n_cols`` centering vector
+        move -- see :class:`_DeviceNormalizedView`.
         """
         if backend == "cpu":
             return self
