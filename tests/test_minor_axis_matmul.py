@@ -9,13 +9,12 @@ other VCS format.
 
 from __future__ import annotations
 
-import tracemalloc
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from vsparse import VCSCArray, VCSRArray
+from vsparse import RECIPES, VCSCArray, VCSRArray
 from vsparse._ops import accumulator_threads
 
 
@@ -93,29 +92,36 @@ def test_no_second_copy_of_the_array_is_built(vcls, rng):
     assert nv._arr is v
 
 
-def test_misaligned_matmul_peak_is_bounded_by_the_accumulator_budget(rng):
-    """Peak memory tracks the (fixed) accumulator budget, not the size of the array."""
-    dense = rng.integers(1, 5, size=(1200, 400)).astype(np.float64)
+@pytest.fixture(scope="module")
+def misaligned_setup():
+    """A 1_200 x 400 VCSC view and a width-2 operand, JIT warmed, built outside the body."""
+    rng = np.random.default_rng(0)
+    dense = rng.integers(1, 5, size=(1_200, 400)).astype(np.float64)
     v = VCSCArray.from_scipy(sp.csc_array(dense))
-    nnz_bytes = v.nnz * v.indices.dtype.itemsize
     B = rng.normal(size=(dense.shape[1], 2))
+    for warm in RECIPES:
+        v.normalized(warm) @ B  # warm up the JIT for every recipe
+    return v, B, dense
 
-    v.normalized() @ B  # warm up the JIT before measuring
 
-    nv = v.normalized()
-    tracemalloc.start()
-    try:
-        before = tracemalloc.get_traced_memory()[0]
-        tracemalloc.reset_peak()
-        out = nv @ B
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
+# 480_000 nonzeros: 3.8 MB of values, 1.9 MB of indices. The accumulator block
+# is `MEMORY_TEST_THREADS * 1_200 * 2 * 8` = 77 KB plus a 19 KB output, so this
+# ceiling is ~2x that and ~15x under the values array.
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+@pytest.mark.limit_memory("256 KB")
+def test_misaligned_matmul_peak_is_bounded_by_the_accumulator_budget(
+    pinned_threads, misaligned_setup, recipe
+):
+    """Peak memory tracks the accumulator budget, not the size of the array."""
+    v, B, _ = misaligned_setup
+    out = v.normalized(recipe) @ B
+    assert out.shape == (1_200, 2)
 
-    # Accumulator block is nthreads * n_rows * width * 8 bytes -- independent
-    # of nnz, so it stays far below a per-nonzero cost for this shape.
-    assert peak - before < nnz_bytes
-    np.testing.assert_allclose(out, _reference(dense) @ B, atol=1e-7)
+
+def test_misaligned_matmul_result_is_still_correct(misaligned_setup):
+    """The bounded-memory path above must also produce the right numbers."""
+    v, B, dense = misaligned_setup
+    np.testing.assert_allclose(v.normalized() @ B, _reference(dense) @ B, atol=1e-7)
 
 
 def test_accumulator_threads_degrades_to_one_for_a_huge_output_axis():

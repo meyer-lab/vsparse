@@ -1,6 +1,13 @@
-from __future__ import annotations
+"""Minor-axis reductions: correctness, and ceilings on what they allocate.
 
-import tracemalloc
+The ``pytest-memray`` ceilings here assert a structural property -- a reduction
+producing an ``n_minor``-sized result must not allocate anything that grows
+with ``nnz``. They rely on ``pinned_threads`` to fix the thread count the
+accumulators are sized by, and on module-scoped fixtures for the inputs, since
+a ``limit_memory`` mark measures the test body alone.
+"""
+
+from __future__ import annotations
 
 import numba
 import numpy as np
@@ -78,31 +85,55 @@ def test_accumulator_block_stays_within_budget(n_minor, bytes_per_element):
         assert nthreads * n_minor * bytes_per_element <= _ACCUMULATOR_BUDGET_BYTES
 
 
+@pytest.fixture(scope="module")
+def reduction_array():
+    """A 2_000 x 500 array with every reduction's JIT warmed, built outside the body."""
+    rng = np.random.default_rng(0)
+    dense = rng.integers(1, 5, size=(2_000, 500)).astype(np.float64)
+    v = VCSRArray.from_scipy(sp.csr_array(dense))
+    for warm in (v.sum, v.max, v.getnnz):
+        warm(axis=0)
+    return v
+
+
+# 1e6 nonzeros here: 8 MB of values, 4 MB of indices. The accumulator block is
+# `MEMORY_TEST_THREADS * 500 * 8` = 16 KB, doubled for the extrema kernels,
+# which carry two. The ceilings sit ~2x over that and orders of magnitude under
+# nnz-scale.
+#
+# Marks go on each `pytest.param`: pytest-memray reads them at collection, so
+# one applied from the test body is never seen and asserts nothing.
 @pytest.mark.parametrize(
     ("label", "call"),
     [
-        ("sum", lambda v: v.sum(axis=0)),
-        ("max", lambda v: v.max(axis=0)),
-        ("getnnz", lambda v: v.getnnz(axis=0)),
+        pytest.param("sum", lambda v: v.sum(axis=0), marks=pytest.mark.limit_memory("64 KB")),
+        pytest.param("max", lambda v: v.max(axis=0), marks=pytest.mark.limit_memory("96 KB")),
+        pytest.param("getnnz", lambda v: v.getnnz(axis=0), marks=pytest.mark.limit_memory("64 KB")),
     ],
 )
-def test_minor_axis_reductions_allocate_nothing_nnz_sized(label, call):
+def test_minor_axis_reductions_allocate_nothing_nnz_sized(
+    pinned_threads, reduction_array, label, call
+):
     """An n_minor-sized result must not cost nnz-sized scratch."""
+    out = call(reduction_array)
+    assert out.shape == (500,)
+
+
+@pytest.fixture(scope="module")
+def selection_array():
+    """A 2_000 x 500 array with the selection kernels' JIT warmed."""
     rng = np.random.default_rng(0)
-    n_rows, n_cols = 2_000, 500
-    dense = rng.integers(1, 5, size=(n_rows, n_cols)).astype(np.float64)
+    dense = rng.integers(1, 5, size=(2_000, 500)).astype(np.float64)
     v = VCSRArray.from_scipy(sp.csr_array(dense))
+    v[:, np.arange(0, 500, 2)]
+    return v
 
-    call(v)  # warm up the JIT before measuring
 
-    tracemalloc.start()
-    try:
-        before = tracemalloc.get_traced_memory()[0]
-        tracemalloc.reset_peak()
-        out = call(v)
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-
-    assert peak - before < 1 << 20, f"{label} allocated {(peak - before) / 1e6:.1f} MB"
-    assert out.shape == (n_cols,)
+# A selection's result does grow with what was selected: half of 1e6 nonzeros
+# is ~2.3 MB of output, which is the answer rather than scratch. The ceiling
+# sits above that and well below output-plus-an-nnz-sized-temporary.
+@pytest.mark.limit_memory("4 MB")
+def test_minor_axis_selection_allocates_no_nnz_sized_scratch(pinned_threads, selection_array):
+    """A selection may pay for its output, but not for a copy of the input."""
+    out = selection_array[:, np.arange(0, 500, 2)]
+    assert out.shape == (2_000, 250)

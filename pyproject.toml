@@ -46,6 +46,7 @@ dev = [
     "ty>=0.0.1a1",
     "hypothesis>=6.100",
     "codespell>=2.3",
+    "pytest-memray>=1.11.0",
 ]
 
 [build-system]
