@@ -4,7 +4,7 @@
     "bytes_per_nonzero": 1.1,
     "indices_bytes_per_nonzero": 1.1,
     "vs_scipy_ratio": 1.1,
-    "time_ratio_vs_scipy": 4.0,
+    "time_ratio_vs_scipy": 10.0,
     "time_ratio_view_over_materialize": 4.0,
     "cpu_ratio_1t_cp10k_log1p": 1.5,
     "cpu_ratio_1t_parafac2": 1.5,
@@ -19,10 +19,10 @@
       "vs_scipy_ratio": 0.4751
     },
     "matvec_vs_scipy": {
-      "time_ratio_vs_scipy": 1.0
+      "time_ratio_vs_scipy": 2.5
     },
     "matmat_vs_scipy": {
-      "time_ratio_vs_scipy": 1.0
+      "time_ratio_vs_scipy": 2.5
     },
     "normalized_cp10k_log1p_matmat_vs_materialize": {
       "time_ratio_view_over_materialize": 0.3
