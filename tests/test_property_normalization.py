@@ -83,7 +83,13 @@ def _recipe_reference(dense: np.ndarray, recipe: str) -> np.ndarray:
     if recipe in ("scanpy", "pearson"):
         std = g.std(axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
-            s = np.where(std > 0, 1.0 / std, 1.0)
+            # Constant columns have no unit-variance scaling; same bound as
+            # the library's `_is_constant_column`, over numpy's own std.
+            eps = np.finfo(np.float64).eps
+            n = dense.shape[0]
+            var = std**2
+            constant = var <= n * eps * var + (n * g.mean(axis=0) * eps) ** 2
+            s = np.where(constant, 1.0, 1.0 / std)
     else:
         s = np.ones(dense.shape[1])
 
