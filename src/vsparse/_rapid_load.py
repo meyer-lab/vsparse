@@ -51,7 +51,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import anndata as ad
 import numba
@@ -119,7 +119,7 @@ def _decode_selected_rows(
     out_data: np.ndarray,
 ) -> None:
     """Decode only selected IVCSR rows while scanning past excluded rows."""
-    pos = 0
+    pos = np.int64(0)
     out_pos = 0
     n_rows = major_ptr.shape[0] - 1
 
@@ -130,15 +130,7 @@ def _decode_selected_rows(
                 prev = np.int64(-1)
                 value = values[g]
                 for _ in range(value_ptr[g], value_ptr[g + 1]):
-                    shift = np.uint64(0)
-                    result = np.uint64(0)
-                    while True:
-                        b = packed[pos]
-                        pos += 1
-                        result |= np.uint64(b & 0x7F) << shift
-                        if b & 0x80 == 0:
-                            break
-                        shift += np.uint64(7)
+                    result, pos = _ivcsc._decode_varint(packed, pos)
                     prev = prev + 1 + np.int64(result)
                     out_indices[out_pos] = prev
                     out_data[out_pos] = value
@@ -364,7 +356,110 @@ def _normalize_and_transform(
 # -- top-level entry point ---------------------------------------------------
 
 
+def _compute_gene_mask(
+    indices: np.ndarray,
+    data: np.ndarray,
+    n_genes: int,
+    denom: int,
+    gene_threshold: float,
+    min_cells: int | None,
+) -> np.ndarray:
+    """Genes with total raw counts above ``gene_threshold * denom``, and detected in >= ``min_cells``."""
+    gene_totals_raw = _weighted_bincount(indices, data, n_genes, accumulator_threads(n_genes))
+    gene_mask = gene_totals_raw > (gene_threshold * denom)
+    if min_cells is not None:
+        gene_detection_counts = _gene_detection_counts(
+            indices, data, n_genes, accumulator_threads(n_genes)
+        )
+        gene_mask &= gene_detection_counts >= min_cells
+    return gene_mask
+
+
+def _rows_without_obs_filter(
+    major_ptr: np.ndarray,
+    values: np.ndarray,
+    value_ptr: np.ndarray,
+    packed: np.ndarray,
+    indices_dtype: np.dtype,
+    cell_totals: np.ndarray,
+    min_cell_counts: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Decode every row; ``metadata_cell_mask`` is just ``cell_mask`` since none were dropped upfront."""
+    cell_mask = cell_totals > min_cell_counts
+    indices = _ivcsc.unpack_indices(value_ptr, packed, indices_dtype)
+    data = _build_data(values, value_ptr, indices.shape[0])
+    row_indptr = value_ptr[major_ptr]
+    return cell_mask, row_indptr, indices, data, cell_mask
+
+
+def _rows_with_obs_filter(
+    major_ptr: np.ndarray,
+    values: np.ndarray,
+    value_ptr: np.ndarray,
+    packed: np.ndarray,
+    indices_dtype: np.dtype,
+    cell_totals: np.ndarray,
+    obs: Any,
+    obs_filter: Callable[[pd.DataFrame], object],
+    min_cell_counts: float,
+    n_cells: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Validate ``obs_filter``, then decode only the rows it selects."""
+    if not isinstance(obs, pd.DataFrame):
+        raise ValueError("obs_filter requires an obs table in the h5ad file")
+    if not callable(obs_filter):
+        raise TypeError("obs_filter must be callable or None")
+
+    obs_mask = np.asarray(obs_filter(obs))
+    if obs_mask.ndim != 1 or obs_mask.shape[0] != n_cells:
+        raise ValueError(f"obs_filter must return a one-dimensional mask of length {n_cells}")
+    if obs_mask.dtype != np.bool_:
+        raise ValueError("obs_filter must return a boolean mask")
+    if not np.any(obs_mask):
+        raise ValueError("obs_filter selected no cells")
+    obs_mask = np.ascontiguousarray(obs_mask)
+
+    selected_rows = np.nonzero(obs_mask)[0]
+    cell_mask = cell_totals[obs_mask] > min_cell_counts
+    row_indptr, indices, data = _build_selected_rows(
+        major_ptr, values, value_ptr, packed, indices_dtype, obs_mask
+    )
+
+    metadata_cell_mask = np.zeros(n_cells, dtype=np.bool_)
+    metadata_cell_mask[selected_rows[cell_mask]] = True
+    return cell_mask, row_indptr, indices, data, metadata_cell_mask, selected_rows.shape[0]
+
+
 _FIELD_KEYS = ("obs", "var", "obsm", "varm", "obsp", "varp", "layers", "uns")
+
+
+def _validate_min_cells(min_cells: int | None) -> None:
+    if min_cells is None:
+        return
+    if isinstance(min_cells, bool) or not isinstance(min_cells, int):
+        raise TypeError("min_cells must be an integer or None")
+    if min_cells < 0:
+        raise ValueError("min_cells must be non-negative")
+
+
+def _read_ivcsr_group(
+    f: Any, x_key: str
+) -> tuple[
+    tuple[int, int], np.dtype, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]
+]:
+    """Read the packed IVCSR array at ``f[x_key]`` plus the surrounding obs/var/etc. fields."""
+    g = f[x_key]
+    shape = (int(g.attrs["shape"][0]), int(g.attrs["shape"][1]))
+    indices_dtype = np.dtype(g.attrs["indices_dtype"])
+    major_ptr = g["major_ptr"][...]
+    values = g["values"][...]
+    value_ptr = g["value_ptr"][...]
+    packed = g["packed_indices"][...]
+
+    kwargs = {k: ad.io.read_elem(f[k]) for k in _FIELD_KEYS if k in f}
+    if "raw" in f:
+        kwargs["raw"] = ad.io.read_elem(f["raw"])
+    return shape, indices_dtype, major_ptr, values, value_ptr, packed, kwargs
 
 
 def load_and_normalize(
@@ -434,24 +529,12 @@ def load_and_normalize(
     import h5py
     import hdf5plugin  # noqa: F401  -- registers the Blosc2 HDF5 filter
 
-    if min_cells is not None:
-        if isinstance(min_cells, bool) or not isinstance(min_cells, int):
-            raise TypeError("min_cells must be an integer or None")
-        if min_cells < 0:
-            raise ValueError("min_cells must be non-negative")
+    _validate_min_cells(min_cells)
 
     with h5py.File(Path(path), "r") as f:
-        g = f[x_key]
-        shape = (int(g.attrs["shape"][0]), int(g.attrs["shape"][1]))
-        indices_dtype = np.dtype(g.attrs["indices_dtype"])
-        major_ptr = g["major_ptr"][...]
-        values = g["values"][...]
-        value_ptr = g["value_ptr"][...]
-        packed = g["packed_indices"][...]
-
-        kwargs = {k: ad.io.read_elem(f[k]) for k in _FIELD_KEYS if k in f}
-        if "raw" in f:
-            kwargs["raw"] = ad.io.read_elem(f["raw"])
+        shape, indices_dtype, major_ptr, values, value_ptr, packed, kwargs = _read_ivcsr_group(
+            f, x_key
+        )
 
     n_cells, n_genes = shape
 
@@ -459,58 +542,28 @@ def load_and_normalize(
     cell_totals = _cell_totals(major_ptr, values, value_ptr)
 
     if obs_filter is None:
-        cell_mask = cell_totals > min_cell_counts
-
-        # Everything past this point needs every nonzero visited at least once.
-        # Each array below is only kept alive as long as something still needs
-        # it -- at nnz-billions scale, an un-`del`ed stale reference is a real
-        # multi-GB cost, not housekeeping.
-        indices = _ivcsc.unpack_indices(value_ptr, packed, indices_dtype)
-        del packed
-        data = _build_data(values, value_ptr, indices.shape[0])
-        row_indptr = value_ptr[major_ptr]
-
-        gene_totals_raw = _weighted_bincount(indices, data, n_genes, accumulator_threads(n_genes))
-        gene_mask = gene_totals_raw > (gene_threshold * n_cells)
-        if min_cells is not None:
-            gene_detection_counts = _gene_detection_counts(
-                indices, data, n_genes, accumulator_threads(n_genes)
-            )
-            gene_mask &= gene_detection_counts >= min_cells
-        metadata_cell_mask = cell_mask
-    else:
-        obs = kwargs.get("obs")
-        if not isinstance(obs, pd.DataFrame):
-            raise ValueError("obs_filter requires an obs table in the h5ad file")
-        if not callable(obs_filter):
-            raise TypeError("obs_filter must be callable or None")
-
-        obs_mask = np.asarray(obs_filter(obs))
-        if obs_mask.ndim != 1 or obs_mask.shape[0] != n_cells:
-            raise ValueError(f"obs_filter must return a one-dimensional mask of length {n_cells}")
-        if obs_mask.dtype != np.bool_:
-            raise ValueError("obs_filter must return a boolean mask")
-        if not np.any(obs_mask):
-            raise ValueError("obs_filter selected no cells")
-        obs_mask = np.ascontiguousarray(obs_mask)
-
-        selected_rows = np.nonzero(obs_mask)[0]
-        cell_mask = cell_totals[obs_mask] > min_cell_counts
-        row_indptr, indices, data = _build_selected_rows(
-            major_ptr, values, value_ptr, packed, indices_dtype, obs_mask
+        cell_mask, row_indptr, indices, data, metadata_cell_mask = _rows_without_obs_filter(
+            major_ptr, values, value_ptr, packed, indices_dtype, cell_totals, min_cell_counts
         )
-        del packed
-
-        gene_totals_raw = _weighted_bincount(indices, data, n_genes, accumulator_threads(n_genes))
-        gene_mask = gene_totals_raw > (gene_threshold * selected_rows.shape[0])
-        if min_cells is not None:
-            gene_detection_counts = _gene_detection_counts(
-                indices, data, n_genes, accumulator_threads(n_genes)
+        gene_denom = n_cells
+    else:
+        cell_mask, row_indptr, indices, data, metadata_cell_mask, gene_denom = (
+            _rows_with_obs_filter(
+                major_ptr,
+                values,
+                value_ptr,
+                packed,
+                indices_dtype,
+                cell_totals,
+                kwargs.get("obs"),
+                obs_filter,
+                min_cell_counts,
+                n_cells,
             )
-            gene_mask &= gene_detection_counts >= min_cells
+        )
+    del packed
 
-        metadata_cell_mask = np.zeros(n_cells, dtype=np.bool_)
-        metadata_cell_mask[selected_rows[cell_mask]] = True
+    gene_mask = _compute_gene_mask(indices, data, n_genes, gene_denom, gene_threshold, min_cells)
 
     new_indptr, out_indices, out_data, kept_rows, n_kept_genes = _filter_and_compact(
         row_indptr, indices, data, cell_mask, gene_mask
@@ -521,9 +574,9 @@ def load_and_normalize(
     X = csr_array((normalized, out_indices, new_indptr), shape=(kept_rows.shape[0], n_kept_genes))
 
     if "obs" in kwargs and "var" in kwargs:
-        adata = ad.AnnData(**kwargs)  # ty: ignore[invalid-argument-type]
+        adata = ad.AnnData(**kwargs)
     else:
-        adata = ad.AnnData(shape=shape, **kwargs)  # ty: ignore[invalid-argument-type]
+        adata = ad.AnnData(shape=shape, **kwargs)
     adata = adata[metadata_cell_mask, gene_mask].copy()
     adata.X = X
 

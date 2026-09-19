@@ -47,6 +47,9 @@ dev = [
     "hypothesis>=6.100",
     "codespell>=2.3",
     "pytest-memray>=1.11.0",
+    "vulture>=2.16",
+    "radon>=6.0.1",
+    "xenon>=0.9.3",
 ]
 
 [build-system]
