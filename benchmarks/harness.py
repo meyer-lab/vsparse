@@ -48,3 +48,26 @@ def integer_counts_csr(n_rows: int, n_cols: int, density: float, seed: int = 0) 
     mat = sp.random_array((n_rows, n_cols), density=density, format="csr", random_state=seed)
     mat.data = np.round(rng.integers(1, 8, size=mat.data.shape[0])).astype(np.float64)
     return mat
+
+
+def best_gpu_time(fn: Callable[[], Any], repeat: int = 7) -> float:
+    """Best wall-clock time over ``repeat`` runs of a CUDA call, in seconds.
+
+    CUDA launches are asynchronous, so timing one the way :func:`best_time`
+    does measures the launch and not the work. This synchronizes on both sides
+    of each run. The warm-up run also absorbs the one-time NVRTC compile of
+    :mod:`vsparse._cuda`'s kernels and cuSPARSE's own first-call setup.
+    """
+    import cupy as cp
+
+    device = cp.cuda.Device()
+    fn()
+    device.synchronize()
+    best = float("inf")
+    for _ in range(repeat):
+        device.synchronize()
+        start = time.perf_counter()
+        fn()
+        device.synchronize()
+        best = min(best, time.perf_counter() - start)
+    return best

@@ -1,6 +1,7 @@
 """Run benchmark cases and compare them against the checked-in baselines.
 
     python -m benchmarks.run --set fast              # run and compare (CI does this)
+    python -m benchmarks.run --set cuda              # the GPU cases (needs a device)
     python -m benchmarks.run --set fast --record     # rewrite baselines.json
     python -m benchmarks.run --case matvec_vs_scipy  # one case
 
@@ -56,7 +57,7 @@ def _compare(results: dict[str, dict[str, float]], baselines: dict) -> list[str]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--set", choices=["fast", "slow", "all"], default="fast")
+    parser.add_argument("--set", choices=["fast", "slow", "cuda", "all"], default="fast")
     parser.add_argument("--case", help="run a single case by name")
     parser.add_argument("--record", action="store_true", help="rewrite baselines.json")
     parser.add_argument("--emit", help=argparse.SUPPRESS)  # internal: run one, print JSON
@@ -71,7 +72,12 @@ def main() -> int:
     if args.case:
         names = [args.case]
     else:
-        chosen = {"fast": case_module.FAST, "slow": case_module.SLOW, "all": case_module.ALL}
+        chosen = {
+            "fast": case_module.FAST,
+            "slow": case_module.SLOW,
+            "cuda": case_module.CUDA,
+            "all": case_module.ALL,
+        }
         names = list(chosen[args.set])
 
     results = {}

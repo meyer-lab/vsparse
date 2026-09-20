@@ -48,6 +48,10 @@ arrays, from the plain (:mod:`vsparse._base`) array types. The matmul kernels
 in :mod:`vsparse._vcs_matmul` walk that same already-materialized ``indices``
 array directly. :class:`VCSCArrayNormalized`/:class:`VCSRArrayNormalized`
 each supply their own ``__matmul__``/``__rmatmul__`` wired to those kernels.
+
+A view can also be moved onto a CUDA device with
+:meth:`NormalizedViewBase.to_gpu`; :mod:`vsparse._cuda` walks the same layout
+there with its own kernels, in float32.
 """
 
 from __future__ import annotations
@@ -1006,6 +1010,18 @@ class NormalizedViewBase:
 
         indptr = arr.value_ptr[arr.major_ptr]
         return ctor((data, arr.indices, indptr), shape=self.shape)
+
+    def to_gpu(self) -> Any:
+        """This view, moved onto the current CUDA device -- see :mod:`vsparse._cuda`.
+
+        Returns a :class:`~vsparse._cuda.CudaNormalizedView`, which keeps the
+        value-compressed layout on the device (no one-float-per-nonzero
+        expansion) and supports the same ``@``/``__rmatmul__`` this view does,
+        in float32. Requires CuPy: ``pip install vsparse[cuda]``.
+        """
+        from vsparse._cuda import to_gpu
+
+        return to_gpu(self)
 
     def norm_sq(self) -> float:
         """Squared Frobenius norm of the full normalized matrix, in ``O(nnz + n_cols)``."""

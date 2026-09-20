@@ -31,6 +31,11 @@ Documentation = "https://meyer-lab.github.io/vsparse/"
 Issues = "https://github.com/meyer-lab/vsparse/issues"
 
 [project.optional-dependencies]
+# CUDA support (`vsparse._cuda`). Kept an opt-in extra because the wheel is
+# ~1 GB and useless without an NVIDIA GPU; CI's CPU jobs pass `--no-extra cuda`.
+cuda = [
+    "cupy-cuda13x[ctk]>=13.3",
+]
 docs = [
     "sphinx>=7.0",
     "furo>=2024.1.29",
@@ -77,6 +82,11 @@ python-version = "3.12"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    # tests/test_cuda.py skips itself without a device, so the marker is for
+    # selecting (`-m cuda`) or excluding (`-m 'not cuda'`) the GPU suite.
+    "cuda: requires CuPy and an NVIDIA GPU",
+]
 
 [tool.coverage.run]
 source = ["src/vsparse"]

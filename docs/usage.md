@@ -131,3 +131,64 @@ This bypasses generic `AnnData` indexing and decompression overhead:
 1. Cell counts are computed in $O(n_{\text{unique}})$ time from unique-value group sizes without touching or decoding the packed `indices` byte stream.
 2. The delta+varint indices are unpacked in parallel across CPU cores.
 3. Row/gene filtering, compaction, and depth normalization ($(\text{cell\_scale}) \times (\text{gene\_sums})$ followed by $\log_{10}(1000x + 1)$) are executed in fused parallel passes directly into the output CSR representation.
+
+## CUDA
+
+A normalized view can be moved onto an NVIDIA GPU with `.to_gpu()`, which needs
+CuPy (`pip install vsparse[cuda]`):
+
+```python
+import numpy as np
+import vsparse
+
+arr = vsparse.VCSRArray.from_scipy(counts)
+gpu = arr.normalized("parafac2").to_gpu()
+
+B = np.random.default_rng(0).normal(size=(arr.shape[1], 16))
+out = gpu @ B  # a float32 CuPy array
+out = B.T @ gpu  # the other direction, likewise
+```
+
+The transfer keeps the value-compressed layout: `to_gpu()` uploads the same
+`major_ptr`/`values`/`value_ptr`/`indices` arrays the host holds, plus the
+$O(n_{\text{rows}} + n_{\text{cols}})$ statistics, never an expanded
+one-float-per-nonzero copy. That is the point on a device, where memory is the
+binding constraint: the benchmarks measure the device-resident view at 0.51x to
+0.62x the bytes of the equivalent CuPy CSR.
+
+Keeping the layout is also why `vsparse` ships its own kernels. cuSPARSE reads
+CSR and CSC only, so nothing in CuPy can walk the two-level
+`major_ptr -> (values, value_ptr) -> indices` structure. Both directions of the
+product, in both formats, are handled by the four kernels in `vsparse._cuda`.
+
+### Precision
+
+Everything floating-point on the device is **float32**, without exception --
+the values, the statistics, the dense operand and the result. The statistics
+themselves are still computed on the host in float64 and narrowed on transfer,
+since the $O(nnz)$ passes that derive them run once where the matmul runs many
+times.
+
+So a device product will not match the host's float64 one to better than
+roughly `1e-6` relative. In the two misaligned directions (`VCSC @ B` and
+`B @ VCSR`) the kernels also accumulate with `atomicAdd`, so repeated runs can
+differ in the last bits; the other two are deterministic.
+
+### Materializing instead
+
+`CudaNormalizedView.to_cupy_sparse()` is the device twin of
+`to_scipy_sparse()`: it expands the runs into a CuPy CSR/CSC of the uncentered
+`Delta` term, leaving `means` to subtract externally. Useful for handing the
+matrix to a library that wants real cuSPARSE input, and it is the baseline the
+kernels are benchmarked against.
+
+Two traps it handles, both worth knowing about if you build such a matrix
+yourself:
+
+- A VCS slice stores its indices grouped by the value they share, never
+  ascending, so the expanded matrix is **not** canonical. cuSPARSE measured
+  ~6x slower on the unsorted form, which is why `to_cupy_sparse` sorts by
+  default (pass `sort_indices=False` to skip it).
+- cuSPARSE is much faster with a CSR operand in *both* directions --
+  `B @ csc` measured ~5x `B @ csr` -- so pass `format="csr"` if you will
+  multiply repeatedly, even from a VCSC-backed view.

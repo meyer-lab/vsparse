@@ -25,6 +25,14 @@ pip install vsparse
 uv add vsparse
 ```
 
+For the CUDA support described below (needs an NVIDIA GPU; pulls in CuPy):
+
+```sh
+pip install "vsparse[cuda]"
+# or with uv
+uv add "vsparse[cuda]"
+```
+
 From source:
 
 ```sh
@@ -140,14 +148,42 @@ adata_norm = vsparse.load_and_normalize(
 )
 ```
 
+### CUDA (`to_gpu`)
+
+A normalized view moves onto an NVIDIA GPU with `.to_gpu()`, keeping its value-compressed layout there rather than expanding to one float per nonzero — so a matrix that only fits in device memory compressed still fits. Everything floating-point on the device is float32.
+
+```python
+gpu = vsparse.VCSRArray.from_scipy(counts).normalized("parafac2").to_gpu()
+out = gpu @ B  # float32 CuPy array; B @ gpu likewise
+```
+
+cuSPARSE reads only CSR/CSC, so walking the VCS layout on the device needs custom kernels; `vsparse._cuda` supplies four, one per (format, direction). Against the alternative — expanding to a sorted CuPy CSR and calling cuSPARSE — they measured (RTX 5080, 60k x 2k, 6M nonzeros, width 16):
+
+| direction | kernel / cuSPARSE | device bytes vs CSR |
+| --- | --- | --- |
+| `VCSR @ B` | 0.71x–0.86x | 0.62x |
+| `VCSC @ B` | 0.83x | 0.51x |
+| `B @ VCSC` | 0.32x | 0.51x |
+| `B @ VCSR` | 0.23x | 0.62x |
+
+`CudaNormalizedView.to_cupy_sparse()` builds that CSR baseline if you want it.
+
 See `docs/` for full usage guides and API documentation.
 
 ## Development
 
 ```sh
-uv sync --all-extras --dev
+uv sync --all-extras --dev     # add --no-extra cuda to skip the ~1 GB CuPy wheel
 uv run pytest
 uv run ruff check .
 uv run ty check
 uv run sphinx-build -b html docs docs/_build/html
+```
+
+The CUDA tests and benchmarks need an NVIDIA GPU; without one `tests/test_cuda.py`
+skips itself. On a GPU machine:
+
+```sh
+uv run pytest -m cuda
+uv run python -m benchmarks.run --set cuda
 ```
