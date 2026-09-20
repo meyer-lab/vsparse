@@ -25,7 +25,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        # --no-extra cuda: the CuPy wheel is ~1 GB and useless without a GPU.
+        # The `cuda` job below installs it on the self-hosted runner instead.
+        run: uv sync --all-extras --no-extra cuda --dev
 
       - name: Lint with Ruff
         run: uv run ruff check .
@@ -57,7 +59,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        # --no-extra cuda: the CuPy wheel is ~1 GB and useless without a GPU.
+        # The `cuda` job below installs it on the self-hosted runner instead.
+        run: uv sync --all-extras --no-extra cuda --dev
 
       - name: Run pytest
         run: uv run pytest --cov
@@ -76,7 +80,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        # --no-extra cuda: the CuPy wheel is ~1 GB and useless without a GPU.
+        # The `cuda` job below installs it on the self-hosted runner instead.
+        run: uv sync --all-extras --no-extra cuda --dev
 
       # Fails if a gated metric exceeds its ceiling in benchmarks/baselines.json.
       # Memory and layout numbers are deterministic and gated tightly; timing is
@@ -84,3 +90,45 @@ jobs:
       # because a shared runner's absolute speed means nothing. See benchmarks/README.md.
       - name: Run benchmark gate
         run: uv run python -m benchmarks.run --set fast
+
+  cuda:
+    name: CUDA Tests and Benchmarks
+    # A self-hosted runner with an NVIDIA GPU and a driver new enough for the
+    # `cupy-cuda13x` wheel. Labelled rather than named so more than one machine
+    # can serve the job. Forked PRs never see this runner, and `pull_request`
+    # from a fork cannot reach a self-hosted runner anyway -- but the guard is
+    # explicit so an untrusted PR can never run code on our own hardware.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, gpu, cuda]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Show the device the job landed on
+        run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # tests/test_cuda.py skips itself if CuPy cannot see a device, which on
+      # this runner would mean the job silently passed without testing
+      # anything. Assert the device is really there first.
+      - name: Assert a CUDA device is visible
+        run: uv run python -c "import vsparse, sys; sys.exit(0 if vsparse.cuda_is_available() else 'no CUDA device visible to CuPy')"
+
+      - name: Run the CUDA tests
+        run: uv run pytest -m cuda
+
+      # Same gate as the CPU benchmark job, over benchmarks/baselines.json.
+      # `cuda_device_bytes_ratio_vs_csr` is deterministic and gated tightly;
+      # the timing ratio is against cuSPARSE on the same device in the same
+      # process, which cancels most of the difference between GPU models, and
+      # is gated loosely for what it does not. See benchmarks/README.md.
+      - name: Run the CUDA benchmark gate
+        run: uv run python -m benchmarks.run --set cuda

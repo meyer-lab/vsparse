@@ -9,18 +9,21 @@ AnnData subclass that holds a VCSC/VCSR array as ``X`` directly.
 from vsparse._anndata import from_anndata, to_layer
 from vsparse._anndata_class import VCSCAnnData
 from vsparse._base import VCSCArray, VCSRArray
+from vsparse._cuda import CudaNormalizedView, cuda_is_available
 from vsparse._norm_common import RECIPES, Recipe
 from vsparse._rapid_load import load_and_normalize, load_packed
 from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 __all__ = [
     "RECIPES",
+    "CudaNormalizedView",
     "Recipe",
     "VCSCAnnData",
     "VCSCArray",
     "VCSCArrayNormalized",
     "VCSRArray",
     "VCSRArrayNormalized",
+    "cuda_is_available",
     "from_anndata",
     "load_and_normalize",
     "load_packed",
