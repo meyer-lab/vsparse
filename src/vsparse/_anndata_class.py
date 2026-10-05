@@ -70,6 +70,17 @@ def _subset_2d(v: Any, oidx: Any, vidx: Any) -> Any:
     return np.asarray(v)[oidx][:, vidx]
 
 
+def _coerce_vcs(value: Any, name: str) -> Any:
+    """Coerce a raw scipy/ndarray ``X``/``raw_X`` value to VCSC/VCSR, validating anything else."""
+    if value is not None and not isinstance(value, _VCS_TYPES):
+        if sp.issparse(value) or isinstance(value, np.ndarray):
+            vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
+            value = vcls.from_scipy(value)
+        else:
+            _check_vcs_type(value, name)
+    return value
+
+
 def _copy_value(v: Any) -> Any:
     """A deep-enough copy of one obs/var/obsm/varm/obsp/varp/layers value.
 
@@ -78,6 +89,23 @@ def _copy_value(v: Any) -> Any:
     implements its own ``.copy()``.
     """
     return None if v is None else v.copy()
+
+
+def _filtered(mapping: Mapping[Any, Any]) -> dict[Any, Any]:
+    """A plain dict of ``mapping``, dropping the ``None`` key anndata sometimes carries."""
+    return {k: v for k, v in mapping.items() if k is not None}
+
+
+def _map_subset_1d(mapping: Mapping[Any, Any], idx: Any) -> dict[Any, Any]:
+    return {k: _subset_1d(v, idx) for k, v in mapping.items() if k is not None}
+
+
+def _map_subset_2d(mapping: Mapping[Any, Any], oidx: Any, vidx: Any) -> dict[Any, Any]:
+    return {k: _subset_2d(v, oidx, vidx) for k, v in mapping.items() if k is not None}
+
+
+def _map_copy(mapping: Mapping[Any, Any]) -> dict[Any, Any]:
+    return {k: _copy_value(v) for k, v in mapping.items() if k is not None}
 
 
 def _check_vcs_type(value: Any, name: str) -> None:
@@ -146,12 +174,7 @@ class VCSCAnnData(ad.AnnData):
 
     @X.setter
     def X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _VCS_TYPES):
-            if sp.issparse(value) or isinstance(value, np.ndarray):
-                vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
-                value = vcls.from_scipy(value)
-            else:
-                _check_vcs_type(value, "X")
+        value = _coerce_vcs(value, "X")
         if (
             value is not None
             and hasattr(self, "_obs")
@@ -168,13 +191,7 @@ class VCSCAnnData(ad.AnnData):
 
     @raw_X.setter
     def raw_X(self, value: Any) -> None:
-        if value is not None and not isinstance(value, _VCS_TYPES):
-            if sp.issparse(value) or isinstance(value, np.ndarray):
-                vcls = VCSCArray if isinstance(value, sp.csc_array | sp.csc_matrix) else VCSRArray
-                value = vcls.from_scipy(value)
-            else:
-                _check_vcs_type(value, "raw_X")
-        self._vcs_raw_X = value
+        self._vcs_raw_X = _coerce_vcs(value, "raw_X")
 
     # -- indexing / view creation ---------------------------------------------
 
@@ -219,11 +236,11 @@ class VCSCAnnData(ad.AnnData):
             obs=obs,
             var=var,
             uns=uns,
-            obsm={k: _subset_1d(v, oidx) for k, v in self.obsm.items() if k is not None},
-            varm={k: _subset_1d(v, vidx) for k, v in self.varm.items() if k is not None},
-            obsp={k: _subset_2d(v, oidx, oidx) for k, v in self.obsp.items() if k is not None},
-            varp={k: _subset_2d(v, vidx, vidx) for k, v in self.varp.items() if k is not None},
-            layers={k: _subset_2d(v, oidx, vidx) for k, v in self.layers.items() if k is not None},
+            obsm=_map_subset_1d(self.obsm, oidx),
+            varm=_map_subset_1d(self.varm, vidx),
+            obsp=_map_subset_2d(self.obsp, oidx, oidx),
+            varp=_map_subset_2d(self.varp, vidx, vidx),
+            layers=_map_subset_2d(self.layers, oidx, vidx),
         )
 
     def copy(self) -> VCSCAnnData:  # ty: ignore[invalid-method-override]
@@ -244,11 +261,11 @@ class VCSCAnnData(ad.AnnData):
             obs=cast(pd.DataFrame, self.obs).copy(),
             var=cast(pd.DataFrame, self.var).copy(),
             uns=_copy.deepcopy(dict(self.uns)),
-            obsm={k: _copy_value(v) for k, v in self.obsm.items() if k is not None},
-            varm={k: _copy_value(v) for k, v in self.varm.items() if k is not None},
-            obsp={k: _copy_value(v) for k, v in self.obsp.items() if k is not None},
-            varp={k: _copy_value(v) for k, v in self.varp.items() if k is not None},
-            layers={k: _copy_value(v) for k, v in self.layers.items() if k is not None},
+            obsm=_map_copy(self.obsm),
+            varm=_map_copy(self.varm),
+            obsp=_map_copy(self.obsp),
+            varp=_map_copy(self.varp),
+            layers=_map_copy(self.layers),
         )
 
     def to_memory(self, *, copy: bool = False) -> VCSCAnnData:
@@ -270,6 +287,33 @@ class VCSCAnnData(ad.AnnData):
         return self.copy()
 
     # -- normalization ----------------------------------------------------------
+
+    def _normalized_from_stored(self, recipe: Recipe) -> Any:
+        """Rebuild a normalized view from ``obs``/``varm``/``uns`` if they match ``recipe``, else ``None``."""
+        stored = self.uns.get(_VSPARSE_UNS_KEY)
+        if not (
+            stored is not None
+            and stored.get("recipe") == recipe.name
+            and _VSPARSE_OBS_A in self.obs
+            and len(self.obs[_VSPARSE_OBS_A]) == self.n_obs
+            and _VSPARSE_VARM_B in self.varm
+            and _VSPARSE_VARM_C in self.varm
+            and _VSPARSE_VARM_S in self.varm
+            and len(self.varm[_VSPARSE_VARM_B]) == self.n_vars
+        ):
+            return None
+        nview_cls = (
+            VCSCArrayNormalized if isinstance(self._vcs_X, VCSCArray) else VCSRArrayNormalized
+        )
+        return nview_cls.from_stats(
+            self._vcs_X,
+            recipe,
+            a=np.asarray(self.obs[_VSPARSE_OBS_A], dtype=np.float64),
+            b=np.asarray(self.varm[_VSPARSE_VARM_B], dtype=np.float64).reshape(-1),
+            c=np.asarray(self.varm[_VSPARSE_VARM_C], dtype=np.float64).reshape(-1),
+            s=np.asarray(self.varm[_VSPARSE_VARM_S], dtype=np.float64).reshape(-1),
+            stale=bool(stored.get("stale", False)),
+        )
 
     def normalized(self, view: str | Recipe = DEFAULT_RECIPE, *, recalculate: bool = True) -> Any:
         """A normalized view of ``X`` -- see :meth:`vsparse._base._VCSBase.normalized`.
@@ -299,31 +343,8 @@ class VCSCAnnData(ad.AnnData):
             cached = cache.get(recipe, self._vcs_X)
             if cached is not None:
                 return cached
-            stored = self.uns.get(_VSPARSE_UNS_KEY)
-            if (
-                stored is not None
-                and stored.get("recipe") == recipe.name
-                and _VSPARSE_OBS_A in self.obs
-                and len(self.obs[_VSPARSE_OBS_A]) == self.n_obs
-                and _VSPARSE_VARM_B in self.varm
-                and _VSPARSE_VARM_C in self.varm
-                and _VSPARSE_VARM_S in self.varm
-                and len(self.varm[_VSPARSE_VARM_B]) == self.n_vars
-            ):
-                nview_cls = (
-                    VCSCArrayNormalized
-                    if isinstance(self._vcs_X, VCSCArray)
-                    else VCSRArrayNormalized
-                )
-                nview = nview_cls.from_stats(
-                    self._vcs_X,
-                    recipe,
-                    a=np.asarray(self.obs[_VSPARSE_OBS_A], dtype=np.float64),
-                    b=np.asarray(self.varm[_VSPARSE_VARM_B], dtype=np.float64).reshape(-1),
-                    c=np.asarray(self.varm[_VSPARSE_VARM_C], dtype=np.float64).reshape(-1),
-                    s=np.asarray(self.varm[_VSPARSE_VARM_S], dtype=np.float64).reshape(-1),
-                    stale=bool(stored.get("stale", False)),
-                )
+            nview = self._normalized_from_stored(recipe)
+            if nview is not None:
                 cache.put(recipe, nview)
                 return nview
 
@@ -360,11 +381,11 @@ class VCSCAnnData(ad.AnnData):
             obs=cast(pd.DataFrame, adata.obs).copy(),
             var=cast(pd.DataFrame, adata.var).copy(),
             uns=adata.uns,
-            obsm={k: v for k, v in adata.obsm.items() if k is not None},
-            varm={k: v for k, v in adata.varm.items() if k is not None},
-            obsp={k: v for k, v in adata.obsp.items() if k is not None},
-            varp={k: v for k, v in adata.varp.items() if k is not None},
-            layers={k: v for k, v in adata.layers.items() if k is not None},
+            obsm=_filtered(adata.obsm),
+            varm=_filtered(adata.varm),
+            obsp=_filtered(adata.obsp),
+            varp=_filtered(adata.varp),
+            layers=_filtered(adata.layers),
         )
 
     def to_anndata(self) -> ad.AnnData:
@@ -376,11 +397,11 @@ class VCSCAnnData(ad.AnnData):
             obs=obs.copy(),
             var=var.copy(),
             uns=self.uns,
-            obsm=cast(Any, {k: v for k, v in self.obsm.items() if k is not None}),
-            varm=cast(Any, {k: v for k, v in self.varm.items() if k is not None}),
-            obsp=cast(Any, {k: v for k, v in self.obsp.items() if k is not None}),
-            varp=cast(Any, {k: v for k, v in self.varp.items() if k is not None}),
-            layers=cast(Any, {k: v for k, v in self.layers.items() if k is not None}),
+            obsm=cast(Any, _filtered(self.obsm)),
+            varm=cast(Any, _filtered(self.varm)),
+            obsp=cast(Any, _filtered(self.obsp)),
+            varp=cast(Any, _filtered(self.varp)),
+            layers=cast(Any, _filtered(self.layers)),
         )
         if self._vcs_raw_X is not None:
             out.raw = ad.AnnData(X=self._vcs_raw_X.to_scipy(), obs=obs.copy(), var=var.copy())
@@ -416,8 +437,7 @@ class VCSCAnnData(ad.AnnData):
         for key in _DF_KEYS:
             ad.io.write_elem(g, key, getattr(self, key), dataset_kwargs=dataset_kwargs)
         for key in _MAPPING_KEYS:
-            mapping = {k: v for k, v in getattr(self, key).items() if k is not None}
-            ad.io.write_elem(g, key, mapping, dataset_kwargs=dataset_kwargs)
+            ad.io.write_elem(g, key, _filtered(getattr(self, key)), dataset_kwargs=dataset_kwargs)
         g.attrs["encoding-type"] = "anndata"
         g.attrs["encoding-version"] = "0.1.0"
 

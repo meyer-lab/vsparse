@@ -551,24 +551,6 @@ class _VCSBase:
         new_shape = (n_minor, idx.shape[0]) if self._format == "csc" else (idx.shape[0], n_minor)
         return type(self)(new_shape, new_major_ptr, new_values, new_value_ptr, new_indices)
 
-    def _major_range(self, start: int, stop: int) -> _VCSBase:
-        """The contiguous major-slice range ``[start, stop)``, without copying values.
-
-        ``values``/``indices`` come back as views; only the two pointer
-        arrays are rebuilt, rebased to the new start.
-        """
-        u0, u1 = int(self.major_ptr[start]), int(self.major_ptr[stop])
-        k0, k1 = int(self.value_ptr[u0]), int(self.value_ptr[u1])
-        n_sel = stop - start
-        new_shape = (self.n_minor, n_sel) if self._format == "csc" else (n_sel, self.n_minor)
-        return type(self)(
-            new_shape,
-            self.major_ptr[start : stop + 1] - u0,
-            self.values[u0:u1],
-            self.value_ptr[u0 : u1 + 1] - k0,
-            self.indices[k0:k1],
-        )
-
     def _select_minor(self, key: Any) -> _VCSBase:
         """Select along the minor axis (rows for VCSC, columns for VCSR).
 

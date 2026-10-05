@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numba
 import numpy as np
 
@@ -30,6 +32,30 @@ def accumulator_threads(n_minor: int, bytes_per_element: int = 8) -> int:
         return 1
     affordable = max(1, _ACCUMULATOR_BUDGET_BYTES // (n_minor * max(1, bytes_per_element)))
     return int(min(numba.get_num_threads(), affordable))
+
+
+#: Tighter than `_ACCUMULATOR_BUDGET_BYTES`, because this scatter also pays to
+#: reduce its partials afterwards: a budget that admits enough threads to make
+#: that reduction dominate is slower than not parallelizing at all.
+_SCATTER_ACCUMULATOR_BUDGET_BYTES = 16 << 20  # 16 MiB
+
+
+def scatter_threads(nnz: int, n_minor: int, width: int = 1) -> int:
+    """Threads for a major-axis scatter of ``nnz`` values into an ``n_minor`` output.
+
+    ``width`` is the number of output columns, 1 for a matvec.
+    """
+    if n_minor <= 0 or nnz <= 0:
+        return 1
+    width = max(1, width)
+    # The scatter is `nnz * width` work split across threads, but reducing the
+    # partials afterwards costs `nthreads * n_minor * width`, so more threads
+    # is not better: their sum is minimized at `sqrt(nnz / n_minor)`. The byte
+    # cap supplies the width-dependence that estimate lacks, admitting fewer
+    # threads as the accumulator grows.
+    affordable = _SCATTER_ACCUMULATOR_BUDGET_BYTES // (n_minor * width * 8)
+    balanced = math.isqrt(max(1, nnz // n_minor))
+    return int(max(1, min(numba.get_num_threads(), affordable, balanced)))
 
 
 @numba.njit(cache=True)
@@ -176,9 +202,78 @@ def _promote(values, other):
     return values.astype(out_dtype, copy=False), other.astype(out_dtype, copy=False)
 
 
+# -- misaligned direction, parallelized over thread-local accumulators -------
+#
+# The serial kernels above scatter into the output along the major axis, so
+# they cannot be parallelized over it: two major slices can collide on the
+# same output index. Each thread accumulates into a private partial instead --
+# the shape `minor_sums`/`minor_extrema` already use -- reduced afterwards.
+
+
+@numba.njit(cache=True, parallel=True)
+def _major_matvec_par(major_ptr, values, value_ptr, indices, x, n_major, n_minor, nthreads):
+    partial = np.zeros((nthreads, n_minor), dtype=values.dtype)
+    span = (n_major + nthreads - 1) // nthreads
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * span
+        end = min(n_major, start + span)
+        local = partial[t]
+        for j in range(start, end):
+            xj = x[j]
+            if xj == 0:
+                continue
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                val = values[u] * xj
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    local[indices[k]] += val
+    # `partial.sum(axis=0)` would widen a narrow dtype (uint16 -> uint64) and
+    # so return a different dtype than the serial kernel for the same input.
+    out = np.zeros(n_minor, dtype=values.dtype)
+    for t in range(nthreads):
+        out += partial[t]
+    return out
+
+
+@numba.njit(cache=True, parallel=True)
+def _major_matmat_par(major_ptr, values, value_ptr, indices, b, n_major, n_minor, nthreads):
+    width = b.shape[1]
+    partial = np.zeros((nthreads, n_minor, width), dtype=values.dtype)
+    span = (n_major + nthreads - 1) // nthreads
+    for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
+        start = t * span
+        end = min(n_major, start + span)
+        local = partial[t]
+        for j in range(start, end):
+            brow = b[j]
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                val = values[u]
+                for k in range(value_ptr[u], value_ptr[u + 1]):
+                    acc = local[indices[k]]
+                    for c in range(width):
+                        acc[c] += val * brow[c]
+    out = np.zeros((n_minor, width), dtype=values.dtype)
+    for t in range(nthreads):
+        out += partial[t]
+    return out
+
+
 def major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor):
     values, x = _promote(values, np.asarray(x))
-    return _major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor)
+    nthreads = scatter_threads(int(value_ptr[-1]) if value_ptr.shape[0] else 0, n_minor)
+    if nthreads <= 1:
+        # One thread's worth of accumulator is the serial kernel with an extra
+        # allocation and a reduction pass, so skip both.
+        return _major_matvec(major_ptr, values, value_ptr, indices, x, n_major, n_minor)
+    return _major_matvec_par(
+        major_ptr,
+        values,
+        value_ptr,
+        indices,
+        np.ascontiguousarray(x),
+        n_major,
+        n_minor,
+        nthreads,
+    )
 
 
 def minor_matvec(major_ptr, values, value_ptr, indices, x, n_major):
@@ -188,7 +283,20 @@ def minor_matvec(major_ptr, values, value_ptr, indices, x, n_major):
 
 def major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor):
     values, b = _promote(values, np.ascontiguousarray(b))
-    return _major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor)
+    width = b.shape[1] if b.ndim == 2 else 1
+    nthreads = scatter_threads(int(value_ptr[-1]) if value_ptr.shape[0] else 0, n_minor, width)
+    if nthreads <= 1:
+        return _major_matmat(major_ptr, values, value_ptr, indices, b, n_major, n_minor)
+    return _major_matmat_par(
+        major_ptr,
+        values,
+        value_ptr,
+        indices,
+        b,
+        n_major,
+        n_minor,
+        nthreads,
+    )
 
 
 def minor_matmat(major_ptr, values, value_ptr, indices, b, n_major):

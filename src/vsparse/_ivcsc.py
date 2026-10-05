@@ -78,22 +78,29 @@ def _pack(value_ptr: np.ndarray, indices: np.ndarray) -> np.ndarray:
 
 
 @numba.njit(cache=True)
+def _decode_varint(buf: np.ndarray, pos: np.int64) -> tuple[np.uint64, np.int64]:
+    """Decode one varint starting at ``pos``; returns ``(value, next_pos)``."""
+    shift = np.uint64(0)
+    result = np.uint64(0)
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= np.uint64(b & 0x7F) << shift
+        if b & 0x80 == 0:
+            break
+        shift += np.uint64(7)
+    return result, pos
+
+
+@numba.njit(cache=True)
 def _unpack(value_ptr: np.ndarray, buf: np.ndarray, out: np.ndarray) -> None:
     n_groups = value_ptr.shape[0] - 1
-    pos = 0
+    pos = np.int64(0)
     for g in range(n_groups):
         start, end = value_ptr[g], value_ptr[g + 1]
         prev = np.int64(-1)
         for k in range(start, end):
-            shift = np.uint64(0)
-            result = np.uint64(0)
-            while True:
-                b = buf[pos]
-                pos += 1
-                result |= np.uint64(b & 0x7F) << shift
-                if b & 0x80 == 0:
-                    break
-                shift += np.uint64(7)
+            result, pos = _decode_varint(buf, pos)
             prev = prev + 1 + np.int64(result)
             out[k] = prev
 
@@ -177,15 +184,7 @@ def _decode_chunks(
             start, end = value_ptr[g], value_ptr[g + 1]
             prev = np.int64(-1)
             for kk in range(start, end):
-                shift = np.uint64(0)
-                result = np.uint64(0)
-                while True:
-                    b = buf[pos]
-                    pos += 1
-                    result |= np.uint64(b & 0x7F) << shift
-                    if b & 0x80 == 0:
-                        break
-                    shift += np.uint64(7)
+                result, pos = _decode_varint(buf, pos)
                 prev = prev + 1 + np.int64(result)
                 out[kk] = prev
 

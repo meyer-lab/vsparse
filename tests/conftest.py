@@ -36,3 +36,22 @@ def csc(dense) -> sp.csc_array:
 @pytest.fixture
 def csr(dense) -> sp.csr_array:
     return sp.csr_array(dense)
+
+
+#: Threads the memory-limited tests run their kernels with. Their accumulators
+#: are ``nthreads * n_minor * width * 8`` bytes, so an unpinned count would make
+#: the same ceiling mean something different on every machine.
+MEMORY_TEST_THREADS = 4
+
+
+@pytest.fixture
+def pinned_threads():
+    """Pin numba's thread count so accumulator sizes are machine-independent."""
+    import numba
+
+    previous = numba.get_num_threads()
+    numba.set_num_threads(MEMORY_TEST_THREADS)
+    try:
+        yield MEMORY_TEST_THREADS
+    finally:
+        numba.set_num_threads(previous)
