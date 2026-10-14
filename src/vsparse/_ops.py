@@ -9,6 +9,7 @@ import numpy as np
 
 __all__ = [
     "accumulator_threads",
+    "indices_in_bounds",
     "major_matmat",
     "major_matvec",
     "minor_counts",
@@ -32,6 +33,34 @@ def accumulator_threads(n_minor: int, bytes_per_element: int = 8) -> int:
         return 1
     affordable = max(1, _ACCUMULATOR_BUDGET_BYTES // (n_minor * max(1, bytes_per_element)))
     return int(min(numba.get_num_threads(), affordable))
+
+
+# Below this many indices, numpy's min/max beat the parallel kernel's launch cost.
+_PARALLEL_BOUNDS_MIN = 1 << 20
+
+
+@numba.njit(cache=True, parallel=True)
+def _count_out_of_bounds(indices: np.ndarray, n: int) -> int:
+    bad = 0
+    for k in numba.prange(indices.shape[0]):  # ty: ignore[not-iterable]
+        v = indices[k]
+        if v < 0 or v >= n:
+            bad += 1
+    return bad
+
+
+def indices_in_bounds(indices: np.ndarray, n: int) -> bool:
+    """True if every entry of ``indices`` lies in ``[0, n)``.
+
+    Large signed-integer arrays are checked in one parallel pass; numpy's
+    ``min()``/``max()`` take two single-threaded passes, which costs over a
+    second on a few billion indices.
+    """
+    if indices.shape[0] == 0:
+        return True
+    if indices.shape[0] >= _PARALLEL_BOUNDS_MIN and indices.dtype.kind == "i":
+        return _count_out_of_bounds(indices, n) == 0
+    return bool(indices.min() >= 0 and indices.max() < n)
 
 
 #: Tighter than `_ACCUMULATOR_BUDGET_BYTES`, because this scatter also pays to

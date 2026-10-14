@@ -66,7 +66,7 @@ class _VCSBase:
             raise ValueError("major_ptr[-1] must equal len(values)")
         if value_ptr[-1] != indices.shape[0]:
             raise ValueError("value_ptr[-1] must equal len(indices)")
-        if indices.shape[0] and (indices.min() < 0 or indices.max() >= n_minor):
+        if not _ops.indices_in_bounds(indices, n_minor):
             raise ValueError("indices out of bounds for the given shape")
 
         # Narrow after the bounds check above, so an out-of-range index is
