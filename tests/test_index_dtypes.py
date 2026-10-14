@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from vsparse import VCSCAnnData, VCSCArray, VCSRArray
+from vsparse import VCSCAnnData, VCSCArray, VCSRArray, _ops
 from vsparse._indexutils import smallest_index_dtype
 
 INT32_MAX = np.iinfo(np.int32).max
@@ -78,6 +78,38 @@ def test_out_of_bounds_index_raises_rather_than_truncating(vcls):
             values=np.array([1.0]),
             value_ptr=np.array([0, 1], dtype=np.int64),
             indices=np.array([2**32 + 1], dtype=np.int64),
+        )
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+@pytest.mark.parametrize("bad", [None, -1, 5000, 2**31 - 1])
+def test_parallel_bounds_check(dtype, bad):
+    """Large index arrays take the one-pass parallel check; it agrees with min/max."""
+    n = 5000
+    if bad is not None and bad > np.iinfo(dtype).max:
+        pytest.skip("value does not fit the dtype")
+    idx = np.random.default_rng(0).integers(0, n, _ops._PARALLEL_BOUNDS_MIN + 3).astype(dtype)
+    idx[-1] = n - 1
+    if bad is not None:
+        idx[len(idx) // 2] = bad
+    assert _ops.indices_in_bounds(idx, n) == (bad is None)
+    assert _ops.indices_in_bounds(idx, n) == bool(idx.min() >= 0 and idx.max() < n)
+
+
+def test_large_out_of_bounds_index_raises(vcls):
+    """The constructor rejects an out-of-range index found by the parallel check."""
+    nnz = _ops._PARALLEL_BOUNDS_MIN + 1
+    n_minor = 10
+    shape = (n_minor, 1) if vcls is VCSCArray else (1, n_minor)
+    indices = np.zeros(nnz, dtype=np.int64)
+    indices[123] = n_minor
+    with pytest.raises(ValueError, match="out of bounds"):
+        vcls(
+            shape,
+            major_ptr=np.array([0, 1], dtype=np.int64),
+            values=np.array([1.0]),
+            value_ptr=np.array([0, nnz], dtype=np.int64),
+            indices=indices,
         )
 
 
