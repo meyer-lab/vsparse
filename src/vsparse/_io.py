@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
     GroupStorageType = h5py.Group | zarr.Group
 
-__all__ = ["write_ivcs_elem"]
+__all__ = ["read_vcs_subset", "write_ivcs_elem"]
 
 _ARRAY_KEYS = ("major_ptr", "values", "value_ptr", "indices")
 _SPEC_VERSION = "0.1.0"
@@ -143,6 +143,85 @@ def _make_read_ivcs(cls: type[_VCSBase]):
         return _with_stats(arr, elem)
 
     return _read
+
+
+def _sorted_unique(idx: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
+    """``idx`` as sorted unique positions, plus how to recover ``idx`` from them (``None``: no need)."""
+    if idx.shape[0] < 2 or bool(np.all(idx[1:] > idx[:-1])):
+        return idx, None
+    uniq, inverse = np.unique(idx, return_inverse=True)
+    return uniq, inverse
+
+
+def read_vcs_subset(
+    elem: GroupStorageType, rows: np.ndarray | None, cols: np.ndarray | None
+) -> _VCSBase:
+    """Read the stored VCS array ``elem``, keeping only ``rows``/``cols`` (int positions, or ``None`` for all).
+
+    Equal to reading the whole array and indexing it with ``[rows, cols]``. An
+    IVCSC/IVCSR array is subset as it's decoded (see
+    :func:`vsparse._ivcsc.unpack_selected`): every packed byte is still read,
+    but only the selected major slices are decoded, and a minor-axis selection
+    is applied in the same pass, so the full matrix is never built. A
+    selection that isn't sorted and unique is decoded as one that is, then
+    reordered in memory.
+
+    A subset doesn't carry the stored statistics sidecar, which describes the
+    whole array; its own :attr:`~vsparse.VCSCArray.stats` are computed on first use.
+    """
+    spec = cast(str, elem.attrs.get("encoding-type", ""))
+    if spec in _IVCS_SPEC_NAMES.values():
+        return _read_ivcs_subset(elem, VCSCArray if spec == "ivcsc" else VCSRArray, rows, cols)
+    arr = cast(_VCSBase, ad.io.read_elem(elem))
+    return arr[slice(None) if rows is None else rows, slice(None) if cols is None else cols]
+
+
+def _major_selection(key: np.ndarray | None, n_major: int) -> tuple[np.ndarray, np.ndarray | None]:
+    """The sorted unique major slices to decode, and how to reorder them into ``key``."""
+    if key is None:
+        return np.arange(n_major, dtype=np.int64), None
+    return _sorted_unique(key)
+
+
+def _minor_remap(
+    key: np.ndarray | None, n_minor: int
+) -> tuple[np.ndarray | None, np.ndarray | None, int]:
+    """Each minor index's new one (``-1``: dropped), how to reorder into ``key``, and the new length."""
+    if key is None:
+        return None, None, n_minor
+    kept, inverse = _sorted_unique(key)
+    remap = np.full(n_minor, -1, dtype=np.int64)
+    remap[kept] = np.arange(kept.shape[0])
+    return remap, inverse, kept.shape[0]
+
+
+def _read_ivcs_subset(
+    elem: GroupStorageType,
+    cls: type[_VCSBase],
+    rows: np.ndarray | None,
+    cols: np.ndarray | None,
+) -> _VCSBase:
+    n_major, n_minor = cls._swap(_read_shape(elem))
+    major_key, minor_key = (cols, rows) if cls is VCSCArray else (rows, cols)
+    sel, major_inverse = _major_selection(major_key, n_major)
+    remap, minor_inverse, n_minor_new = _minor_remap(minor_key, n_minor)
+
+    values = read_array(elem["values"])
+    major_ptr, groups, value_ptr, indices = _ivcsc.unpack_selected(
+        read_array(elem["major_ptr"]),
+        read_array(elem["value_ptr"]),
+        read_array(elem["packed_indices"]),
+        sel,
+        remap,
+        n_minor_new,
+    )
+    n_rows, n_cols = cls._swap((sel.shape[0], n_minor_new))
+    arr = cls((n_rows, n_cols), major_ptr, values[groups], value_ptr, indices)
+    if major_inverse is not None:
+        arr = arr._select_major(major_inverse)
+    if minor_inverse is not None:
+        arr = arr._select_minor(minor_inverse)
+    return arr
 
 
 def _register() -> None:

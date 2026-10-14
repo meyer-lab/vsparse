@@ -127,6 +127,31 @@ va = vsparse.load_packed("archived.ivcsr.h5ad")
 norm = va.X.normalized("parafac2")
 ```
 
+### Subsetting while loading
+
+`load_packed(path, obs_idx=..., var_idx=...)` returns exactly
+`load_packed(path)[obs_idx, var_idx]`, but subsets `X` as it decodes rather than
+after. Each selection is a boolean mask over the axis, an array of integer positions
+(negative positions count from the end; unsorted or repeated positions come back in
+that order), or a slice; select by label by converting first, e.g. with
+`obs.index.get_indexer(labels)`.
+
+For an IVCSR file only the selected cells' indices are decoded, and a gene selection
+drops and renumbers indices in that same pass (IVCSC: the same, with cells and genes
+swapped). The full matrix is never allocated. Every packed byte is still read from
+disk, though: with no stored per-row byte offsets, finding where each selected cell
+starts takes a parallel scan of the stream. The subset doesn't carry the file's
+statistics sidecar (see below), which describes the whole matrix; its own `stats` are
+computed on first use.
+
+```python
+import anndata, h5py
+
+with h5py.File("archived.ivcsr.h5ad") as f:  # read only obs to build the mask
+    mask = anndata.io.read_elem(f["obs"])["condition"] == "control"
+controls = vsparse.load_packed("archived.ivcsr.h5ad", obs_idx=mask, var_idx=hvg_positions)
+```
+
 ### Statistics sidecar
 
 Each `VCSCArray`/`VCSRArray` carries a {class}`vsparse.VCSStats` as `arr.stats`:
