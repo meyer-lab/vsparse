@@ -17,7 +17,6 @@
 
 .. autofunction:: vsparse.to_layer
 
-.. autofunction:: vsparse.load_and_normalize
 
 .. autoclass:: vsparse.CudaNormalizedView
    :members:
