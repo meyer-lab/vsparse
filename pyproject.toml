@@ -15,6 +15,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
     "numpy>=2.0",
@@ -34,7 +35,7 @@ Issues = "https://github.com/meyer-lab/vsparse/issues"
 # CUDA support (`vsparse._cuda`). Kept an opt-in extra because the wheel is
 # ~1 GB and useless without an NVIDIA GPU; CI's CPU jobs pass `--no-extra cuda`.
 cuda = [
-    "cupy-cuda13x[ctk]>=13.3",
+    "cupy-cuda13x[ctk]>=13.0, <15.0",
 ]
 docs = [
     "sphinx>=7.0",

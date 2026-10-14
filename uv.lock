@@ -1859,7 +1859,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anndata", specifier = ">=0.13" },
-    { name = "cupy-cuda13x", extras = ["ctk"], marker = "extra == 'cuda'", specifier = ">=13.3" },
+    { name = "cupy-cuda13x", extras = ["ctk"], marker = "extra == 'cuda'", specifier = ">=13.0,<15.0" },
     { name = "furo", marker = "extra == 'docs'", specifier = ">=2024.1.29" },
     { name = "hdf5plugin", specifier = ">=4.0" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0" },
