@@ -6,6 +6,7 @@ hand.
 ```sh
 uv run python -m benchmarks.run --set fast            # run + compare (what CI does)
 uv run python -m benchmarks.run --set slow            # the larger cases
+uv run python -m benchmarks.run --set cuda            # the GPU cases (needs a device)
 uv run python -m benchmarks.run --case matvec_vs_scipy
 uv run python -m benchmarks.run --set fast --record   # rewrite baselines.json
 ```
@@ -40,11 +41,44 @@ recorded for context.
 
 Memory is no longer measured here; see below.
 
+## The CUDA set
+
+`--set cuda` measures `vsparse._cuda`'s kernels against the alternative they
+exist to beat: expanding the value-compressed layout to one float per nonzero
+and letting cuSPARSE do the product. It runs on the self-hosted GPU runner, not
+the shared ones, and needs `uv sync --all-extras` (the CPU jobs pass
+`--no-extra cuda`).
+
+The baseline is deliberately the *best* materialized option rather than the
+cheapest to produce, so the comparison is not a strawman: CSR in every case,
+including for a VCSC-backed view whose natural materialization is CSC, and
+index-sorted. Both matter more than expected -- `B @ csc` measured ~5x
+`B @ csr`, and an unsorted CSR ~6x a sorted one -- so `to_cupy_sparse` sorts by
+default and the cases pass `format="csr"`.
+
+Three metrics, of which two are gated:
+
+- `cuda_time_ratio_kernel_over_csr` -- steady-state throughput, ours over
+  cuSPARSE's on the already-built CSR. Gated loosely, for the same reason the
+  scipy ratios are: it is a ratio measured on the same device in the same
+  process, which cancels most of the difference between GPU models but not all
+  of it (the two development GPUs differed by up to 1.8x on this metric).
+- `cuda_device_bytes_ratio_vs_csr` -- device memory held, ours over the CSR's.
+  Deterministic, so gated tightly. This is the number the kernels exist to buy.
+- `cuda_materialize_in_matmuls` -- how many of our matmuls the one-time
+  materialization costs. Recorded for context, not gated.
+
+Timing a CUDA call needs `best_gpu_time`, not `best_time`: launches are
+asynchronous, so an unsynchronized timer measures the launch and not the work.
+
 ## Adding a case
 
 Write a function returning `{metric: value}` in `cases.py`, decorated with
-`@fast` (runs on every PR, keep it under a minute) or `@slow`. Add any new
-gated metric to `margins` in `baselines.json`, then `--record`.
+`@fast` (runs on every PR, keep it under a minute), `@slow`, or `@cuda`. Add any
+new gated metric to `margins` in `baselines.json`, then `--record`.
+
+Record CUDA ceilings on the *slowest* device you expect to run them on, so a
+faster one cannot trip a gate it should pass.
 
 ## Memory is a test, not a benchmark
 

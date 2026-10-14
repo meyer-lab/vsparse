@@ -7,6 +7,7 @@ import numpy as np
 
 from benchmarks.harness import (
     best_cpu_time,
+    best_gpu_time,
     best_time,
     integer_counts_csr,
     ratio_vs_scipy,
@@ -14,6 +15,7 @@ from benchmarks.harness import (
 
 FAST: dict[str, Callable[[], dict[str, float]]] = {}
 SLOW: dict[str, Callable[[], dict[str, float]]] = {}
+CUDA: dict[str, Callable[[], dict[str, float]]] = {}
 
 
 def fast(fn):
@@ -23,6 +25,11 @@ def fast(fn):
 
 def slow(fn):
     SLOW[fn.__name__] = fn
+    return fn
+
+
+def cuda(fn):
+    CUDA[fn.__name__] = fn
     return fn
 
 
@@ -345,4 +352,122 @@ def large_layout_and_matmul() -> dict[str, float]:
     }
 
 
-ALL: dict[str, Callable[[], dict[str, float]]] = {**FAST, **SLOW}
+# -- CUDA kernels vs materializing to a sparse matrix ------------------------
+#
+# The question `vsparse._cuda` exists to answer: is walking the
+# value-compressed layout on the device with our own kernels actually
+# competitive with expanding it to one float per nonzero and handing the
+# product to cuSPARSE -- which is what `to_cupy_sparse()` does, and the device
+# twin of the `to_scipy_sparse()` path a caller would otherwise take.
+#
+# Two numbers matter and they pull opposite ways:
+#
+# `cuda_time_ratio_kernel_over_csr` -- steady-state throughput, our kernel over
+# cuSPARSE on the already-built CSR. A ratio above 1 would be defensible: we
+# recompute `g` on every nonzero at every call where the CSR baked it in once,
+# against a heavily tuned library. In practice every direction measures below
+# 1, because the kernel reads ~40% less memory (the layout is the whole point)
+# and this is a bandwidth-bound problem -- and `dense @ sparse` is a shape
+# cuSPARSE handles particularly poorly, where we measured 0.17x-0.32x.
+#
+# `cuda_device_bytes_ratio_vs_csr` -- device memory held, ours over the CSR's.
+# This is what the layout buys, it is deterministic, and it is the reason the
+# throughput comes out where it does, so unlike the timing it is gated tightly.
+#
+# The one-time materialization is reported as `cuda_materialize_in_matmuls`:
+# how many of our matmuls the caller pays up front to reach the CSR baseline at
+# all. These run only on a GPU runner (`--set cuda`).
+
+_CUDA_ROWS, _CUDA_COLS, _CUDA_WIDTH = 60_000, 2_000, 16
+
+
+def _cuda_setup(cls_name: str, recipe: str):
+    """``(gpu_view, csr, means, mat)`` for a CUDA case.
+
+    The baseline is deliberately the *best* materialized option, not the
+    cheapest one to produce, so the ratio is not a strawman: CSR in every case
+    (including for a VCSC-backed view, whose natural materialization is CSC --
+    `B @ csc` measured ~5x `B @ csr`), and index-sorted, which
+    `to_cupy_sparse` does by default (unsorted measured ~6x slower again).
+    `cuda_materialize_in_matmuls` times that same full call, so both the
+    conversion and the sort are counted where a caller would pay them.
+    """
+    import vsparse
+
+    mat = integer_counts_csr(_CUDA_ROWS, _CUDA_COLS, density=0.05)
+    nv = getattr(vsparse, cls_name).from_scipy(mat).normalized(recipe)
+    gpu = nv.to_gpu()
+    return gpu, gpu.to_cupy_sparse(format="csr"), gpu.means, mat
+
+
+def _csr_device_bytes(csr) -> int:
+    return int(csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes)
+
+
+def _cuda_metrics(gpu, csr, via_kernel, via_csr) -> dict[str, float]:
+    """Time both sides, check they agree, and report the three metrics."""
+    import cupy as cp
+
+    cp.testing.assert_allclose(via_kernel(), via_csr(), rtol=2e-4, atol=2e-4)
+    kernel_time = best_gpu_time(via_kernel)
+    return {
+        "cuda_time_ratio_kernel_over_csr": kernel_time / best_gpu_time(via_csr),
+        "cuda_device_bytes_ratio_vs_csr": gpu.nbytes / _csr_device_bytes(csr),
+        "cuda_materialize_in_matmuls": best_gpu_time(lambda: gpu.to_cupy_sparse(format="csr"))
+        / kernel_time,
+    }
+
+
+def _cuda_matmul_case(cls_name: str, recipe: str) -> Callable[[], dict[str, float]]:
+    """``gpu @ B`` against ``csr @ B`` plus the same rank-1 correction."""
+
+    def bench() -> dict[str, float]:
+        import cupy as cp
+
+        gpu, csr, means, mat = _cuda_setup(cls_name, recipe)
+        B = cp.asarray(
+            np.random.default_rng(0).normal(size=(mat.shape[1], _CUDA_WIDTH)), dtype=cp.float32
+        )
+        return _cuda_metrics(gpu, csr, lambda: gpu @ B, lambda: csr @ B + (-means) @ B)
+
+    direction = "matmul" if cls_name == "VCSRArray" else "matmul_misaligned"
+    bench.__name__ = f"cuda_{recipe}_{direction}_vs_csr"
+    return bench
+
+
+def _cuda_rmatmul_case(cls_name: str, recipe: str) -> Callable[[], dict[str, float]]:
+    """``B @ gpu`` against ``B @ csr`` plus the same rank-1 correction."""
+
+    def bench() -> dict[str, float]:
+        import cupy as cp
+
+        gpu, csr, means, mat = _cuda_setup(cls_name, recipe)
+        B = cp.asarray(
+            np.random.default_rng(0).normal(size=(_CUDA_WIDTH, mat.shape[0])), dtype=cp.float32
+        )
+        correction = B.sum(axis=1)[:, None] * (-means)[None, :]
+        return _cuda_metrics(gpu, csr, lambda: B @ gpu, lambda: B @ csr + correction)
+
+    direction = "rmatmul" if cls_name == "VCSCArray" else "rmatmul_misaligned"
+    bench.__name__ = f"cuda_{recipe}_{direction}_vs_csr"
+    return bench
+
+
+def _register_cuda_benchmarks() -> None:
+    from vsparse import RECIPES
+
+    # Every recipe in the aligned direction, since the recipes differ only in
+    # `g` and that is a per-nonzero cost the kernel pays and the CSR does not.
+    for recipe in sorted(RECIPES):
+        cuda(_cuda_matmul_case("VCSRArray", recipe))
+    # One recipe is enough for the other three directions: they exercise the
+    # kernel's structure (register accumulation vs atomicAdd), not `g`.
+    cuda(_cuda_rmatmul_case("VCSCArray", "parafac2"))
+    cuda(_cuda_matmul_case("VCSCArray", "parafac2"))
+    cuda(_cuda_rmatmul_case("VCSRArray", "parafac2"))
+
+
+_register_cuda_benchmarks()
+
+
+ALL: dict[str, Callable[[], dict[str, float]]] = {**FAST, **SLOW, **CUDA}

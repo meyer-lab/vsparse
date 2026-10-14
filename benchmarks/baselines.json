@@ -10,7 +10,9 @@
     "cpu_ratio_1t_parafac2": 1.5,
     "cpu_ratio_1t_pearson": 1.5,
     "cpu_ratio_1t_raw": 1.5,
-    "cpu_ratio_1t_scanpy": 1.5
+    "cpu_ratio_1t_scanpy": 1.5,
+    "cuda_time_ratio_kernel_over_csr": 2.0,
+    "cuda_device_bytes_ratio_vs_csr": 1.1
   },
   "cases": {
     "layout_bytes_per_nonzero": {
@@ -99,6 +101,38 @@
     },
     "misaligned_rmatmat_vs_scipy": {
       "time_ratio_vs_scipy": 1.0817
+    },
+    "cuda_cp10k_log1p_matmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.6947,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
+    },
+    "cuda_parafac2_matmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.4385,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
+    },
+    "cuda_pearson_matmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.4353,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
+    },
+    "cuda_raw_matmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.4316,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
+    },
+    "cuda_scanpy_matmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.7048,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
+    },
+    "cuda_parafac2_rmatmul_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 0.6483,
+      "cuda_device_bytes_ratio_vs_csr": 0.5575
+    },
+    "cuda_parafac2_matmul_misaligned_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 1.6738,
+      "cuda_device_bytes_ratio_vs_csr": 0.5575
+    },
+    "cuda_parafac2_rmatmul_misaligned_vs_csr": {
+      "cuda_time_ratio_kernel_over_csr": 0.4632,
+      "cuda_device_bytes_ratio_vs_csr": 0.6792
     }
   }
 }

@@ -19,6 +19,13 @@
 
 .. autofunction:: vsparse.load_and_normalize
 
+.. autoclass:: vsparse.CudaNormalizedView
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autofunction:: vsparse.cuda_is_available
+
 .. autoclass:: vsparse.VCSCAnnData
    :members:
    :undoc-members:
