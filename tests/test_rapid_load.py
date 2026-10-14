@@ -42,7 +42,7 @@ def _write_ivcsr(tmp_path, dense: np.ndarray, name="data.ivcsr.h5ad"):
     adata = ad.AnnData(X=sp.csr_array(dense))
     vad = VCSCAnnData.from_anndata(adata, format="csr")
     path = tmp_path / name
-    vad.write_h5ad(path, format="ivcsc")
+    vad.write_h5ad(path)
     return path
 
 
@@ -126,7 +126,7 @@ def test_min_cells_uses_obs_filtered_cohort(tmp_path):
     )
     adata = ad.AnnData(X=sp.csr_array(dense), obs=obs)
     path = tmp_path / "min_cells_obs_filter.ivcsr.h5ad"
-    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path, format="ivcsc")
+    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path)
 
     obs_mask = np.asarray(obs["condition"] == "control")
     result = load_and_normalize(
@@ -180,7 +180,7 @@ def test_obs_filter_matches_subset_reference(tmp_path):
     )
     adata = ad.AnnData(X=sp.csr_array(dense), obs=obs)
     path = tmp_path / "obs_filter.ivcsr.h5ad"
-    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path, format="ivcsc")
+    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path)
 
     obs_mask = np.asarray(obs["condition"] == "control")
     result = load_and_normalize(
@@ -217,7 +217,7 @@ def test_obs_filter_applied_before_cell_filtering_and_slices_metadata(tmp_path, 
     obsp = {"distances": rng.random((n_cells, n_cells))}
     adata = ad.AnnData(X=sp.csr_array(dense), obs=obs, var=var, obsm=obsm, obsp=obsp)
     path = tmp_path / "obs_filter_metadata.ivcsr.h5ad"
-    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path, format="ivcsc")
+    VCSCAnnData.from_anndata(adata, format="csr").write_h5ad(path)
 
     obs_mask = np.asarray(obs["condition"] == "control")
     selected_rows = np.nonzero(obs_mask)[0]
@@ -317,7 +317,7 @@ def test_metadata_sliced_correctly(tmp_path, rng):
 
     path = tmp_path / "metadata_test.ivcsr.h5ad"
     vad = VCSCAnnData.from_anndata(adata, format="csr")
-    vad.write_h5ad(path, format="ivcsc")
+    vad.write_h5ad(path)
 
     min_cell_counts = 10.0
     gene_threshold = 0.05
@@ -423,7 +423,7 @@ def test_load_packed_metadata_preserved(tmp_path, rng):
     adata.var["gene"] = [f"g{i}" for i in range(6)]
     vad = VCSCAnnData.from_anndata(adata, format="csr")
     path = tmp_path / "meta.ivcsr.h5ad"
-    vad.write_h5ad(path, format="ivcsc")
+    vad.write_h5ad(path)
 
     result = load_packed(path)
     pd.testing.assert_index_equal(result.obs.index, adata.obs.index)

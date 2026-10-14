@@ -3,7 +3,6 @@ from __future__ import annotations
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pytest
 import scipy.sparse as sp
 
 from vsparse import VCSCAnnData, VCSRArray
@@ -31,13 +30,12 @@ def _adata(n_cells: int = 400, n_genes: int = 20) -> ad.AnnData:
     return ad.AnnData(X=X, obs=obs, var=var)
 
 
-@pytest.mark.parametrize("fmt", ["vcsc", "ivcsc"])
-def test_string_columns_are_written_as_categoricals(tmp_path, fmt):
+def test_string_columns_are_written_as_categoricals(tmp_path):
     va = VCSCAnnData.from_anndata(_adata(), format="csr")
     assert not isinstance(va.obs["cell_type"].dtype, pd.CategoricalDtype)
 
-    path = tmp_path / f"data.{fmt}.h5ad"
-    va.write_h5ad(path, format=fmt)
+    path = tmp_path / "data.h5ad"
+    va.write_h5ad(path)
     back = VCSCAnnData.read_h5ad(path)
 
     assert isinstance(back.obs["cell_type"].dtype, pd.CategoricalDtype)
