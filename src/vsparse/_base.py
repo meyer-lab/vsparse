@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sp
 
-from vsparse import _construct, _ops
+from vsparse import _construct, _ops, _stats
 from vsparse._indexutils import is_full_slice as _is_full_slice
 from vsparse._indexutils import normalize_major_idx as _normalize_major_idx
 from vsparse._indexutils import smallest_index_dtype as _smallest_index_dtype
@@ -42,7 +42,7 @@ class _VCSBase:
     # __rmatmul__/__rmul__ instead of trying to broadcast us as an ndarray.
     __array_ufunc__ = None
 
-    __slots__ = ("_norm_cache", "indices", "major_ptr", "shape", "value_ptr", "values")
+    __slots__ = ("_norm_cache", "_stats", "indices", "major_ptr", "shape", "value_ptr", "values")
 
     def __init__(
         self,
@@ -81,6 +81,7 @@ class _VCSBase:
         self.value_ptr = value_ptr
         self.indices = indices
         self._norm_cache = _NormCache()
+        self._stats: _stats.VCSStats | None = None
 
     # -- axis bookkeeping ------------------------------------------------
 
@@ -117,14 +118,29 @@ class _VCSBase:
             f"<{cls} shape={self.shape} dtype={self.dtype} nnz={self.nnz} n_unique={self.n_unique}>"
         )
 
+    @property
+    def stats(self) -> _stats.VCSStats:
+        """Per-row/per-column totals and nonzero counts -- see :mod:`vsparse._stats`.
+
+        Computed on first access (``O(nnz)``) and kept, or restored from the
+        sidecar of a file written by :meth:`~vsparse.VCSCAnnData.write_h5ad`/
+        :meth:`~vsparse.VCSCAnnData.write_zarr`. Normalization reads its
+        per-cell/per-gene scales (``a``/``b``) from here.
+        """
+        if self._stats is None:
+            self._stats = _stats.compute_stats(self)
+        return self._stats
+
     def copy(self):
-        return type(self)(
+        out = type(self)(
             self.shape,
             self.major_ptr.copy(),
             self.values.copy(),
             self.value_ptr.copy(),
             self.indices.copy(),
         )
+        out._stats = self._stats  # same data, so the same (read-only) statistics
+        return out
 
     # -- construction / conversion ---------------------------------------
 
