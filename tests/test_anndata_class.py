@@ -111,7 +111,7 @@ def test_zarr_roundtrip(base_adata, dense, tmp_path):
 def test_h5ad_ivcsc_roundtrip(base_adata, dense, tmp_path):
     va = VCSCAnnData.from_anndata(base_adata)
     path = tmp_path / "test_ivcsc.h5ad"
-    va.write_h5ad(path, format="ivcsc")
+    va.write_h5ad(path)
 
     import h5py
 
@@ -130,17 +130,11 @@ def test_h5ad_ivcsc_roundtrip(base_adata, dense, tmp_path):
 def test_zarr_ivcsc_roundtrip(base_adata, dense, tmp_path):
     va = VCSCAnnData.from_anndata(base_adata, format="csr")
     path = tmp_path / "test_ivcsr.zarr"
-    va.write_zarr(path, format="ivcsc")
+    va.write_zarr(path)
 
     read_back = VCSCAnnData.read_zarr(path)
     assert isinstance(read_back.X, VCSRArray)
     np.testing.assert_allclose(read_back.X.to_scipy().toarray(), dense)
-
-
-def test_write_h5ad_rejects_bad_format(base_adata, tmp_path):
-    va = VCSCAnnData.from_anndata(base_adata)
-    with pytest.raises(ValueError):
-        va.write_h5ad(tmp_path / "bad.h5ad", format="bogus")
 
 
 def test_write_h5ad_default_compression(base_adata, tmp_path):

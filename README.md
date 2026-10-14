@@ -109,6 +109,7 @@ va.X  # VCSCArray
 va.raw_X  # VCSCArray (separate from anndata's .raw)
 
 # Persist to HDF5 (.h5ad) or Zarr with default Blosc2+LZ4 compression
+# (stored as IVCSC/IVCSR, see below)
 va.write_h5ad("compressed.h5ad")  # Read back with VCSCAnnData.read_h5ad
 va2 = vsparse.VCSCAnnData.read_h5ad("compressed.h5ad")
 
@@ -121,13 +122,13 @@ plain = va.to_anndata()
 
 ### Byte-Packed On-Disk Format (IVCSC / IVCSR)
 
-For smaller files, pass `format="ivcsc"` (or `"ivcsr"`) on write. This byte-packs the minor-axis indices with delta + varint encoding (inspired by [IVSparse's IVCSC](https://github.com/Seth-Wolfgang/IVSparse)).
+`write_h5ad` / `write_zarr` always store `X`/`raw_X` as IVCSC (from VCSC) or IVCSR (from VCSR). This byte-packs the minor-axis indices with delta + varint encoding (inspired by [IVSparse's IVCSC](https://github.com/Seth-Wolfgang/IVSparse)).
 
 It is purely an archival storage format: `read_h5ad` / `read_zarr` decompress the indices on load and return a standard `VCSCArray`/`VCSRArray`.
 
 ```python
-# Write delta+varint byte-packed indices
-va.write_h5ad("archived.h5ad", format="ivcsc")
+# Writes delta+varint byte-packed indices
+va.write_h5ad("archived.h5ad")
 
 # Reads back directly as an ordinary VCSCAnnData
 va_loaded = vsparse.VCSCAnnData.read_h5ad("archived.h5ad")
