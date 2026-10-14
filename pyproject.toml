@@ -80,6 +80,10 @@ ignore-words-list = "coo"
 [tool.ty.environment]
 python-version = "3.12"
 
+[tool.ty.analysis]
+# CuPy is an optional extra; the lint job syncs without it.
+allowed-unresolved-imports = ["cupy", "cupyx.**"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
