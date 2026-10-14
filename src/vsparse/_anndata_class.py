@@ -212,7 +212,18 @@ class VCSCAnnData(ad.AnnData):
         oidx, vidx = self._normalize_indices(index)
         oidx = _as_slice_index(oidx, self.n_obs)
         vidx = _as_slice_index(vidx, self.n_vars)
+        return type(self)(
+            X=_subset_2d(self._vcs_X, oidx, vidx),
+            raw_X=_subset_2d(self._vcs_raw_X, oidx, vidx),
+            **self._subset_fields(oidx, vidx),
+        )
 
+    def _subset_fields(self, oidx: Any, vidx: Any) -> dict[str, Any]:
+        """Every field but ``X``/``raw_X``, subset to positions ``oidx``/``vidx``.
+
+        Shared by :meth:`__getitem__` and :func:`~vsparse.load_packed`'s
+        ``obs_idx``/``var_idx``, which decodes ``X`` already subset.
+        """
         obs = cast(pd.DataFrame, self.obs).iloc[oidx].copy()
         var = cast(pd.DataFrame, self.var).iloc[vidx].copy()
 
@@ -229,18 +240,16 @@ class VCSCAnnData(ad.AnnData):
         if _VSPARSE_UNS_KEY in uns:
             uns = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
 
-        return type(self)(
-            X=_subset_2d(self._vcs_X, oidx, vidx),
-            raw_X=_subset_2d(self._vcs_raw_X, oidx, vidx),
-            obs=obs,
-            var=var,
-            uns=uns,
-            obsm=_map_subset_1d(self.obsm, oidx),
-            varm=_map_subset_1d(self.varm, vidx),
-            obsp=_map_subset_2d(self.obsp, oidx, oidx),
-            varp=_map_subset_2d(self.varp, vidx, vidx),
-            layers=_map_subset_2d(self.layers, oidx, vidx),
-        )
+        return {
+            "obs": obs,
+            "var": var,
+            "uns": uns,
+            "obsm": _map_subset_1d(self.obsm, oidx),
+            "varm": _map_subset_1d(self.varm, vidx),
+            "obsp": _map_subset_2d(self.obsp, oidx, oidx),
+            "varp": _map_subset_2d(self.varp, vidx, vidx),
+            "layers": _map_subset_2d(self.layers, oidx, vidx),
+        }
 
     def copy(self) -> VCSCAnnData:  # ty: ignore[invalid-method-override]
         """A deep copy, preserving the VCSC/VCSR-backed ``X``/``raw_X``.

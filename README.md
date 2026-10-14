@@ -143,6 +143,16 @@ va = vsparse.load_packed("archived.h5ad")
 norm = va.X.normalized("parafac2")  # lazy view; norm @ B works without densifying
 ```
 
+`load_packed` can also subset as it decodes: `obs_idx`/`var_idx` take a boolean mask, an array of integer positions, or a slice, and give the same result as indexing a full load, without ever building the full matrix. With IVCSR, only the selected cells are decoded and unselected genes are dropped in the same pass (IVCSC is the same with the axes swapped). Every packed byte is still read, so reading the stream sets the floor: on a 1.26M-cell file, a 1% cell subset decodes `X` in 0.21 s against 0.50 s for all of it.
+
+```python
+import anndata, h5py
+
+with h5py.File("archived.h5ad") as f:  # read only obs to build the mask
+    obs = anndata.io.read_elem(f["obs"])
+va_blood = vsparse.load_packed("archived.h5ad", obs_idx=obs["tissue"] == "blood")
+```
+
 ### CUDA (`to_gpu`)
 
 A normalized view moves onto an NVIDIA GPU with `.to_gpu()`, keeping its value-compressed layout there rather than expanding to one float per nonzero — so a matrix that only fits in device memory compressed still fits. Everything floating-point on the device is float32.

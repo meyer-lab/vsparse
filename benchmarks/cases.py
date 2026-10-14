@@ -352,6 +352,62 @@ def large_layout_and_matmul() -> dict[str, float]:
     }
 
 
+@slow
+def subset_load_vs_full_load() -> dict[str, float]:
+    """Reading ``X`` subset as it's unpacked, against reading all of it, from a zstd IVCSR file.
+
+    Random selections of 0.1/1/10% of cells, a "clustered" 1% (one contiguous
+    run, as selecting a single sample tends to be), and 1% of cells with 10%
+    of genes. Each ratio is that read's time over a full read of ``X``. Every
+    packed byte is still read either way, so reading the stream is the floor.
+    Whole ``load_packed`` calls also read ``obs``/``var``, which is recorded
+    separately since it costs the same either way (and, with a string index of
+    this many cells, more than ``X`` does).
+    """
+    import tempfile
+    from pathlib import Path
+
+    import anndata as ad
+    import h5py
+    import pandas as pd
+
+    from vsparse import VCSCAnnData, VCSRArray, load_packed
+    from vsparse._io import read_vcs_subset
+
+    n_obs, n_vars = 400_000, 3_000
+    mat = integer_counts_csr(n_obs, n_vars, density=0.02)
+    adata = VCSCAnnData(
+        X=VCSRArray.from_scipy(mat),
+        obs=pd.DataFrame(index=np.arange(n_obs).astype(str)),
+        var=pd.DataFrame(index=np.arange(n_vars).astype(str)),
+    )
+    del mat
+    rng = np.random.default_rng(0)
+    start = n_obs // 3
+    selections = {
+        f"random_{frac:g}": (np.flatnonzero(rng.random(n_obs) < frac), None)
+        for frac in (0.001, 0.01, 0.1)
+    }
+    selections["clustered_0.01"] = (np.arange(start, start + n_obs // 100), None)
+    selections["cells_0.01_genes_0.1"] = (
+        np.flatnonzero(rng.random(n_obs) < 0.01),
+        np.flatnonzero(rng.random(n_vars) < 0.1),
+    )
+    out: dict[str, float] = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "bench.ivcsr.h5ad"
+        adata.write_h5ad(path)
+        del adata
+        with h5py.File(path, "r") as f:
+            full = best_time(lambda: ad.io.read_elem(f["X"]), repeat=5)
+            out["full_x_seconds"] = full
+            for name, (rows, cols) in selections.items():
+                t = best_time(lambda rows=rows, cols=cols: read_vcs_subset(f["X"], rows, cols), 5)
+                out[f"time_ratio_{name}"] = t / full
+        out["full_load_packed_seconds"] = best_time(lambda: load_packed(path), repeat=3)
+    return out
+
+
 # -- CUDA kernels vs materializing to a sparse matrix ------------------------
 #
 # The question `vsparse._cuda` exists to answer: is walking the
