@@ -27,7 +27,6 @@ _AnyVCS = _VCSBase
 _DF_KEYS = ("obs", "var")
 _MAPPING_KEYS = ("obsm", "varm", "obsp", "varp", "layers", "uns")
 _FIELD_KEYS = (*_DF_KEYS, *_MAPPING_KEYS)
-_STORE_FORMATS = ("vcsc", "ivcsc")
 
 # Names statistics are recorded under in .obs/.varm/.uns -- see .normalized().
 _VSPARSE_UNS_KEY = "vsparse"
@@ -419,21 +418,17 @@ class VCSCAnnData(ad.AnnData):
         self,
         g: Any,
         *,
-        format: str = "vcsc",
         convert_strings_to_categoricals: bool = True,
         dataset_kwargs: Mapping[str, Any] = MappingProxyType({}),
     ) -> None:
-        if format not in _STORE_FORMATS:
-            raise ValueError(f"format must be one of {_STORE_FORMATS}, got {format!r}")
         if convert_strings_to_categoricals:
             # Writing field-by-field skips what anndata's own writers do here,
             # leaving low-cardinality columns as one string per row.
             self.strings_to_categoricals()
-        write_array = ad.io.write_elem if format == "vcsc" else _io.write_ivcs_elem
         if self._vcs_X is not None:
-            write_array(g, "X", self._vcs_X, dataset_kwargs=dataset_kwargs)
+            _io.write_ivcs_elem(g, "X", self._vcs_X, dataset_kwargs=dataset_kwargs)
         if self._vcs_raw_X is not None:
-            write_array(g, "raw_X", self._vcs_raw_X, dataset_kwargs=dataset_kwargs)
+            _io.write_ivcs_elem(g, "raw_X", self._vcs_raw_X, dataset_kwargs=dataset_kwargs)
         for key in _DF_KEYS:
             ad.io.write_elem(g, key, getattr(self, key), dataset_kwargs=dataset_kwargs)
         for key in _MAPPING_KEYS:
@@ -455,22 +450,20 @@ class VCSCAnnData(ad.AnnData):
         self,
         filename: str | PathLike[str],
         *,
-        format: str = "vcsc",
         convert_strings_to_categoricals: bool = True,
         dataset_kwargs: Mapping[str, Any] | None = None,
         **_kwargs: Any,
     ) -> None:
         """Write to ``.h5ad``. Read back with :meth:`read_h5ad`.
 
+        ``X``/``raw_X`` are always stored as IVCSC (from VCSC) or IVCSR (from
+        VCSR): the minor-axis indices are byte-packed (delta + varint
+        encoding), at the cost of extra work on write/read. They come back from
+        :meth:`read_h5ad` as ordinary VCSCArray/VCSRArray objects -- IVCSC/IVCSR
+        is purely an on-disk storage format.
+
         Parameters
         ----------
-        format
-            ``"vcsc"`` (default) stores ``X``/``raw_X`` with plain int arrays
-            for the minor-axis indices. ``"ivcsc"`` (IVCSC/IVCSR) instead
-            byte-packs them (delta + varint encoding) for a smaller file, at
-            the cost of extra work on write/read. Either way, ``X``/``raw_X``
-            come back from :meth:`read_h5ad` as ordinary VCSCArray/VCSRArray
-            objects -- ``"ivcsc"`` is purely an on-disk storage format.
         convert_strings_to_categoricals
             Convert ``obs``/``var`` string columns to categorical in place
             before writing, as ``anndata``'s own writers do. Only columns
@@ -491,7 +484,6 @@ class VCSCAnnData(ad.AnnData):
         ):
             self._write_group(
                 f,
-                format=format,
                 convert_strings_to_categoricals=convert_strings_to_categoricals,
                 dataset_kwargs=dataset_kwargs,
             )
@@ -508,15 +500,14 @@ class VCSCAnnData(ad.AnnData):
         self,
         store: Any,
         *,
-        format: str = "vcsc",
         convert_strings_to_categoricals: bool = True,
         dataset_kwargs: Mapping[str, Any] | None = None,
         **_kwargs: Any,
     ) -> None:
         """Write to a zarr store. Read back with :meth:`read_zarr`.
 
-        See :meth:`write_h5ad` for ``format``/``convert_strings_to_categoricals``/
-        ``dataset_kwargs`` (including the numeric-only compression behavior);
+        See :meth:`write_h5ad` for the IVCSC/IVCSR storage format and
+        ``convert_strings_to_categoricals``/``dataset_kwargs`` (including the numeric-only compression behavior);
         the default compression here is Blosc+LZ4 via ``numcodecs``.
         """
         import zarr
@@ -527,7 +518,6 @@ class VCSCAnnData(ad.AnnData):
             f = zarr.open_group(store, mode="w")
             self._write_group(
                 f,
-                format=format,
                 convert_strings_to_categoricals=convert_strings_to_categoricals,
                 dataset_kwargs=dataset_kwargs,
             )

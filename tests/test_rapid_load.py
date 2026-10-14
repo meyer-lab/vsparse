@@ -12,7 +12,7 @@ def _write_ivcsr(tmp_path, dense: np.ndarray, name="data.ivcsr.h5ad"):
     adata = ad.AnnData(X=sp.csr_array(dense))
     vad = VCSCAnnData.from_anndata(adata, format="csr")
     path = tmp_path / name
-    vad.write_h5ad(path, format="ivcsc")
+    vad.write_h5ad(path)
     return path
 
 
@@ -39,7 +39,7 @@ def test_load_packed_metadata_preserved(tmp_path, rng):
     adata.var["gene"] = [f"g{i}" for i in range(6)]
     vad = VCSCAnnData.from_anndata(adata, format="csr")
     path = tmp_path / "meta.ivcsr.h5ad"
-    vad.write_h5ad(path, format="ivcsc")
+    vad.write_h5ad(path)
 
     result = load_packed(path)
     pd.testing.assert_index_equal(result.obs.index, adata.obs.index)

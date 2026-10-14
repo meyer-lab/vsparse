@@ -97,13 +97,12 @@ def test_derived_arrays_stay_narrow(vcls, dense, op):
     assert op(v, dense).indices.dtype == np.int32
 
 
-@pytest.mark.parametrize("fmt", ["vcsc", "ivcsc"])
-def test_roundtrip_preserves_values_and_stores_narrow_indices(tmp_path, dense, fmt):
+def test_roundtrip_preserves_values_and_stores_narrow_indices(tmp_path, dense):
     import anndata as ad
 
     va = VCSCAnnData.from_anndata(ad.AnnData(X=sp.csr_array(dense)), format="csr")
-    path = tmp_path / f"data.{fmt}.h5ad"
-    va.write_h5ad(path, format=fmt)
+    path = tmp_path / "data.h5ad"
+    va.write_h5ad(path)
 
     back = VCSCAnnData.read_h5ad(path)
     assert isinstance(back.X, VCSRArray)
@@ -120,7 +119,7 @@ def test_packed_write_narrows_a_wide_in_memory_array(tmp_path, dense):
     va.X.indices = va.X.indices.astype(np.int64)
 
     path = tmp_path / "wide.h5ad"
-    va.write_h5ad(path, format="ivcsc")
+    va.write_h5ad(path)
 
     back = VCSCAnnData.read_h5ad(path)
     assert isinstance(back.X, VCSRArray)

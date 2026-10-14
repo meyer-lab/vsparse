@@ -89,8 +89,7 @@ allowlist of types, so a plain `AnnData` cannot hold a `VCSCArray` in `X`.
 zarr). Pass `dataset_kwargs={}` to write uncompressed, or your own
 `dataset_kwargs` to use a different codec.
 
-`X`/`raw_X` are stored in the VCSC/VCSR layout by default (`format="vcsc"`).
-Passing `format="ivcsc"` instead stores them as **IVCSC/IVCSR** -- the same
+`X`/`raw_X` are always stored as **IVCSC/IVCSR** -- the VCSC/VCSR
 layout, but with the minor-axis `indices` array delta+varint byte-packed
 (inspired by [IVSparse's IVCSC](https://github.com/Seth-Wolfgang/IVSparse)).
 This is a *file-storage-only* format: it trades extra CPU on write/read for a
@@ -99,7 +98,7 @@ smaller file, and there is no in-memory IVCSC array type to compute with --
 decompressed from IVCSC/IVCSR immediately on load.
 
 ```python
-va.write_h5ad("archived.h5ad", format="ivcsc")
+va.write_h5ad("archived.h5ad")
 va4 = vsparse.VCSCAnnData.read_h5ad("archived.h5ad")  # va4.X is a plain VCSCArray
 ```
 `VCSCAnnData` works around this by overriding the `X` property; as a consequence,

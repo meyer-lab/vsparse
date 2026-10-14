@@ -34,7 +34,7 @@ def load_packed(path: str | PathLike[str], *, x_key: str = "X") -> VCSCAnnData:
     ----------
     path
         Path to an ``.h5ad`` file whose ``X`` (or a top-level group named
-        ``x_key``) was written with ``format="ivcsc"``/``"ivcsr"`` (see
+        ``x_key``) was stored as IVCSC/IVCSR (see
         :meth:`~vsparse.VCSCAnnData.write_h5ad`).
     x_key
         Top-level h5ad group holding the IVCSR/IVCSC array (``"X"`` by default).
