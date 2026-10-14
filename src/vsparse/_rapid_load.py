@@ -40,7 +40,7 @@ def load_packed(path: str | PathLike[str], *, x_key: str = "X") -> VCSCAnnData:
         Top-level h5ad group holding the IVCSR/IVCSC array (``"X"`` by default).
     """
     import h5py
-    import hdf5plugin  # noqa: F401  -- registers the Blosc2 HDF5 filter
+    import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
 
     with h5py.File(Path(path), "r") as f:
         X = ad.io.read_elem(f[x_key])

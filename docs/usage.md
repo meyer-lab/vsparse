@@ -84,10 +84,13 @@ allowlist of types, so a plain `AnnData` cannot hold a `VCSCArray` in `X`.
 
 ### On-disk compression and the IVCSC/IVCSR storage format
 
-`write_h5ad`/`write_zarr` compress every array with Blosc2+LZ4 by default
-(`h5py`/`hdf5plugin` for `.h5ad`, `numcodecs`/zarr's native Blosc codec for
-zarr). Pass `dataset_kwargs={}` to write uncompressed, or your own
-`dataset_kwargs` to use a different codec.
+`write_h5ad`/`write_zarr` compress every numeric array with zstd at level 1
+by default (`h5py`/`hdf5plugin` for `.h5ad`, `numcodecs`/zarr's native zstd
+codec for zarr). On read, `.h5ad` arrays are decompressed chunk-by-chunk in
+parallel (`numba.get_num_threads()` threads) rather than through HDF5's
+single-threaded filter pipeline. Files written with the earlier Blosc2+LZ4
+default still read, through the ordinary h5py path. Pass `dataset_kwargs={}`
+to write uncompressed, or your own `dataset_kwargs` to use a different codec.
 
 `X`/`raw_X` are always stored as **IVCSC/IVCSR** -- the VCSC/VCSR
 layout, but with the minor-axis `indices` array delta+varint byte-packed
