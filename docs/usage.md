@@ -127,6 +127,23 @@ va = vsparse.load_packed("archived.ivcsr.h5ad")
 norm = va.X.normalized("parafac2")
 ```
 
+### Statistics sidecar
+
+Each `VCSCArray`/`VCSRArray` carries a {class}`vsparse.VCSStats` as `arr.stats`:
+per-row `row_sums`/`row_nnz` (total counts, n-genes-by-counts), per-column
+`col_sums`/`col_nnz` (total counts, n-cells-by-counts), and `col_depth_sums`, the
+per-column sum of depth-normalized values `sum_i x[i, j] / row_sums[i]`. They are
+computed on first access (one pass over the data) and kept.
+
+`write_h5ad`/`write_zarr` always store them, as a versioned `stats` subgroup of
+`X`/`raw_X`, and readers (including `load_packed`) attach them, so QC filters on
+these columns need no read of `X`. Normalization takes every recipe's
+per-cell and per-gene scales (`a`/`b` in `y = (g(x * a * b) - c) * s`) from the
+sidecar; the centering/scaling terms `c`/`s` depend on the nonlinear `g`, so they
+still take one pass per recipe. A file without a usable sidecar -- written by an
+earlier version, or with an unrecognized sidecar version -- reads as before, and the
+statistics are recomputed when first needed.
+
 ## CUDA
 
 A normalized view can be moved onto an NVIDIA GPU with `.to_gpu()`, which needs

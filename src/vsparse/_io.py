@@ -6,6 +6,12 @@ nested inside ``adata.uns``, or as ``X``/a custom top-level key on a
 :class:`~vsparse.VCSCAnnData` -- and survive a round trip through HDF5 or zarr
 without any manual (de)serialization.
 
+Both formats store the array's statistics sidecar (see :mod:`vsparse._stats`)
+as a ``stats`` subgroup next to the array data. Readers attach it when it's
+present and valid, and otherwise leave the array to recompute it on demand, so
+files without one -- written by earlier versions, or by other tools -- still
+read normally.
+
 This relies on ``anndata._io.specs.registry``, an internal (not yet public)
 extension mechanism -- the same one anndata itself uses to support
 dask/awkward/cupy arrays. It is not guaranteed stable across anndata
@@ -23,7 +29,7 @@ import h5py
 import numpy as np
 import zarr
 
-from vsparse import _ivcsc
+from vsparse import _ivcsc, _stats
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
 from vsparse._compression import read_array
 from vsparse._indexutils import smallest_index_dtype
@@ -55,20 +61,31 @@ def _write_vcs(
     g.attrs["shape"] = v.shape
     for name in _ARRAY_KEYS:
         _writer.write_elem(g, name, getattr(v, name), dataset_kwargs=dataset_kwargs)
+    _stats.write_stats(g, v.stats, write_elem=_writer.write_elem, dataset_kwargs=dataset_kwargs)
+
+
+def _read_shape(elem: GroupStorageType) -> tuple[int, int]:
+    shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
+    return (shape_vals[0], shape_vals[1])
+
+
+def _with_stats(arr: _VCSBase, elem: GroupStorageType) -> _VCSBase:
+    """Attach the sidecar stored under ``elem``, if there's a usable one -- see :mod:`vsparse._stats`."""
+    arr._stats = _stats.read_stats(elem, arr.shape)
+    return arr
 
 
 def _make_read_vcs(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
-        shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
-        shape = (shape_vals[0], shape_vals[1])
         arrays = {name: read_array(elem[name]) for name in _ARRAY_KEYS}
-        return cls(
-            shape,
+        arr = cls(
+            _read_shape(elem),
             arrays["major_ptr"],
             arrays["values"],
             arrays["value_ptr"],
             arrays["indices"],
         )
+        return _with_stats(arr, elem)
 
     return _read
 
@@ -88,6 +105,9 @@ def write_ivcs_elem(
     the registry, e.g. via ``anndata.io.read_elem``) always reconstructs a
     normal VCSCArray/VCSRArray with a plain ``indices`` array.
 
+    ``v``'s statistics sidecar (:attr:`~vsparse.VCSCArray.stats`) is written
+    alongside, computing it first if ``v`` doesn't carry it yet.
+
     Unlike the VCSC/VCSR codec registered below, this is not reachable
     through anndata's generic ``write_elem`` type dispatch (which can only
     route by the Python type of ``v``, and both formats share the same
@@ -106,21 +126,21 @@ def write_ivcs_elem(
         ad.io.write_elem(g, name, getattr(v, name), dataset_kwargs=dataset_kwargs)
     packed = _ivcsc.pack_indices(v.value_ptr, v.indices)
     ad.io.write_elem(g, "packed_indices", packed, dataset_kwargs=dataset_kwargs)
+    _stats.write_stats(g, v.stats, write_elem=ad.io.write_elem, dataset_kwargs=dataset_kwargs)
     g.attrs["encoding-type"] = "ivcsc" if v._format == "csc" else "ivcsr"
     g.attrs["encoding-version"] = _IVCS_SPEC_VERSION
 
 
 def _make_read_ivcs(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
-        shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
-        shape = (shape_vals[0], shape_vals[1])
         major_ptr = read_array(elem["major_ptr"])
         values = read_array(elem["values"])
         value_ptr = read_array(elem["value_ptr"])
         packed = read_array(elem["packed_indices"])
         dtype = np.dtype(cast(str, elem.attrs["indices_dtype"]))
         indices = _ivcsc.unpack_indices(value_ptr, packed, dtype)
-        return cls(shape, major_ptr, values, value_ptr, indices)
+        arr = cls(_read_shape(elem), major_ptr, values, value_ptr, indices)
+        return _with_stats(arr, elem)
 
     return _read
 
