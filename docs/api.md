@@ -13,6 +13,9 @@
    :show-inheritance:
    :inherited-members:
 
+.. autoclass:: vsparse.VCSStats
+   :members:
+
 .. autofunction:: vsparse.from_anndata
 
 .. autofunction:: vsparse.to_layer

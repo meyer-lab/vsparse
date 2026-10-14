@@ -100,6 +100,17 @@ def test_subset_load_matches_indexing_a_full_load(packed_path, chunking, selecti
     _assert_matches_indexing(packed_path, *selection)
 
 
+def test_subset_recomputes_rather_than_inherits_the_stats_sidecar(packed_path):
+    mask = np.zeros(N_OBS, dtype=bool)
+    mask[::3] = True
+    subset: Any = load_packed(packed_path, obs_idx=mask).X
+    full: Any = load_packed(packed_path).X
+    assert subset._stats is None
+    expected = full[mask]
+    np.testing.assert_array_equal(subset.stats.row_sums, expected.stats.row_sums)
+    np.testing.assert_array_equal(subset.stats.col_depth_sums, expected.stats.col_depth_sums)
+
+
 def test_metadata_masks_work_directly(packed_path):
     full = load_packed(packed_path)
     mask = full.obs["group"] == 2  # a pandas Series

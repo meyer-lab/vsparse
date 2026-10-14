@@ -53,7 +53,9 @@ def _compress(major_ptr_in, minor_indices, data, n_major):
 
         seg_vals = data[start:end]
         seg_minor = minor_indices[start:end]
-        order = np.argsort(seg_vals)
+        # Stable, so each value group keeps its minor indices in input order
+        # (sorted, for canonical scipy input) -- see vsparse._stats.
+        order = np.argsort(seg_vals, kind="mergesort")
         sorted_vals = seg_vals[order]
         sorted_minor = seg_minor[order]
 

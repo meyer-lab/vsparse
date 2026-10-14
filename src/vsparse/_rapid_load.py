@@ -97,7 +97,7 @@ def load_packed(
 
 def _load_subset(x_elem: Any, kwargs: dict[str, Any], obs_idx: Any, var_idx: Any) -> VCSCAnnData:
     """:func:`load_packed` with a selection: ``X`` subset as it's decoded, the rest after reading."""
-    n_obs, n_vars = (int(s) for s in np.asarray(x_elem.attrs["shape"]).tolist())
+    n_obs, n_vars = _io._read_shape(x_elem)
     rows = _positions(obs_idx, n_obs, "obs_idx")
     cols = _positions(var_idx, n_vars, "var_idx")
     X = _io.read_vcs_subset(x_elem, rows, cols)

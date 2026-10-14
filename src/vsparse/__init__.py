@@ -12,6 +12,7 @@ from vsparse._base import VCSCArray, VCSRArray
 from vsparse._cuda import CudaNormalizedView, cuda_is_available
 from vsparse._norm_common import RECIPES, Recipe
 from vsparse._rapid_load import load_packed
+from vsparse._stats import VCSStats
 from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "VCSCArrayNormalized",
     "VCSRArray",
     "VCSRArrayNormalized",
+    "VCSStats",
     "cuda_is_available",
     "from_anndata",
     "load_packed",

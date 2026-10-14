@@ -153,6 +153,15 @@ with h5py.File("archived.h5ad") as f:  # read only obs to build the mask
 va_blood = vsparse.load_packed("archived.h5ad", obs_idx=obs["tissue"] == "blood")
 ```
 
+### Statistics sidecar
+
+Every `VCSCArray`/`VCSRArray` carries per-row and per-column summary statistics as `arr.stats` (a `vsparse.VCSStats`): `row_sums`/`col_sums` (total counts), `row_nnz`/`col_nnz` (n-genes/n-cells by counts), and `col_depth_sums` (per-gene sums of depth-normalized counts). They are computed on first access and written next to `X`/`raw_X` by `write_h5ad`/`write_zarr` whether or not they were ever computed or a normalized view was ever made, so a file read back has them without touching the data. Every recipe's per-cell and per-gene scales (`a`/`b`) are derived from them, so only centering/scaling recipes still need a pass over the data. Files without a usable sidecar (older versions, other tools) load as before, and the statistics are recomputed when first needed.
+
+```python
+va = vsparse.VCSCAnnData.read_h5ad("archived.h5ad")
+keep = va.X.stats.row_sums >= 500  # QC filter from the sidecar alone
+```
+
 ### CUDA (`to_gpu`)
 
 A normalized view moves onto an NVIDIA GPU with `.to_gpu()`, keeping its value-compressed layout there rather than expanding to one float per nonzero — so a matrix that only fits in device memory compressed still fits. Everything floating-point on the device is float32.
