@@ -113,26 +113,19 @@ views, concatenation, most of the scanpy/anndata ecosystem -- are **not** suppor
 directly, so they round-trip through `write_elem`/`read_elem` even when nested inside
 a plain `AnnData`'s `.uns`, independent of `VCSCAnnData`.
 
-## Fast IVCSR loading and normalization
+## Loading and normalizing IVCSR files
 
-When working with large IVCSR-stored `.h5ad` files, `vsparse.load_and_normalize` provides
-a fused loader and depth-normalization kernel reproducing the preprocessing in
-`parafac2.normalize.prepare_dataset`:
+`vsparse.load_packed` decodes an IVCSR/IVCSC-stored `.h5ad` into a `VCSCAnnData`.
+Loading, subsetting, and normalization are separate steps; normalization is a
+lazy view (`.normalized("parafac2")`) over the loaded array, so the steps can be
+mixed and matched rather than fused into one loader:
 
 ```python
 import vsparse
 
-adata = vsparse.load_and_normalize(
-    "archived.ivcsr.h5ad",
-    min_cell_counts=10.0,
-    gene_threshold=0.05,
-)
+va = vsparse.load_packed("archived.ivcsr.h5ad")
+norm = va.X.normalized("parafac2")
 ```
-
-This bypasses generic `AnnData` indexing and decompression overhead:
-1. Cell counts are computed in $O(n_{\text{unique}})$ time from unique-value group sizes without touching or decoding the packed `indices` byte stream.
-2. The delta+varint indices are unpacked in parallel across CPU cores.
-3. Row/gene filtering, compaction, and depth normalization ($(\text{cell\_scale}) \times (\text{gene\_sums})$ followed by $\log_{10}(1000x + 1)$) are executed in fused parallel passes directly into the output CSR representation.
 
 ## CUDA
 

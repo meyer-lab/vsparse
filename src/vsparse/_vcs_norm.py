@@ -3,8 +3,7 @@
 :class:`VCSCArrayNormalized`/:class:`VCSRArrayNormalized` wrap a plain
 (unpacked) VCSC/VCSR array and behave like a normalized matrix -- read-depth
 normalized, transformed, optionally centered/scaled, per one of
-:data:`vsparse._norm_common.RECIPES` (the default, ``"parafac2"``, matches
-what :func:`vsparse._rapid_load.load_and_normalize` builds) -- without ever
+:data:`vsparse._norm_common.RECIPES` (the default is ``"parafac2"``) -- without ever
 materializing it. See :mod:`vsparse._norm_common` for the shared recipe/
 statistics/materialization logic (:class:`~vsparse._norm_common.NormalizedViewBase`)
 and :mod:`vsparse._vcs_matmul` for the matmul kernels these use (a direct

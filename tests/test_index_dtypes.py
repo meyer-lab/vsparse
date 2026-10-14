@@ -6,7 +6,6 @@ import scipy.sparse as sp
 
 from vsparse import VCSCAnnData, VCSCArray, VCSRArray
 from vsparse._indexutils import smallest_index_dtype
-from vsparse._rapid_load import _filter_and_compact
 
 INT32_MAX = np.iinfo(np.int32).max
 
@@ -126,47 +125,3 @@ def test_packed_write_narrows_a_wide_in_memory_array(tmp_path, dense):
     assert isinstance(back.X, VCSRArray)
     assert back.X.indices.dtype == np.int32
     np.testing.assert_allclose(back.X.toarray(), dense)
-
-
-def _small_filter_inputs():
-    dense = np.array(
-        [[1.0, 0.0, 2.0, 0.0], [0.0, 3.0, 0.0, 4.0], [5.0, 0.0, 6.0, 0.0]],
-        dtype=np.float32,
-    )
-    return sp.csr_array(dense), np.array([True, False, True]), np.array([True, False, True, False])
-
-
-def test_filter_and_compact_uses_int32_when_both_bounds_fit():
-    X, cell_mask, gene_mask = _small_filter_inputs()
-    new_indptr, out_indices, out_data, kept_rows, n_kept = _filter_and_compact(
-        X.indptr, X.indices, X.data, cell_mask, gene_mask
-    )
-
-    assert new_indptr.dtype == np.int32
-    assert out_indices.dtype == np.int32
-    assert n_kept == 2
-    np.testing.assert_array_equal(kept_rows, [0, 2])
-    np.testing.assert_allclose(out_data, [1.0, 2.0, 5.0, 6.0])
-    np.testing.assert_array_equal(out_indices, [0, 1, 0, 1])
-
-
-def test_gene_indices_stay_int32_when_pointers_need_int64(monkeypatch):
-    """Forced, since a >INT32_MAX-nonzero matrix cannot be allocated in a test."""
-    import vsparse._rapid_load as rapid_load
-
-    X, cell_mask, gene_mask = _small_filter_inputs()
-    nnz_in = int(X.indices.shape[0])
-    real = rapid_load.smallest_index_dtype
-
-    monkeypatch.setattr(
-        rapid_load,
-        "smallest_index_dtype",
-        lambda n: np.dtype(np.int64) if n == nnz_in else real(n),
-    )
-    new_indptr, out_indices, _, _, _ = _filter_and_compact(
-        X.indptr, X.indices, X.data, cell_mask, gene_mask
-    )
-
-    assert new_indptr.dtype == np.int64
-    assert out_indices.dtype == np.int32
-    np.testing.assert_array_equal(out_indices, [0, 1, 0, 1])
