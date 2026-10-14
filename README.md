@@ -133,19 +133,13 @@ va.write_h5ad("archived.h5ad", format="ivcsc")
 va_loaded = vsparse.VCSCAnnData.read_h5ad("archived.h5ad")
 ```
 
-### Fast Filtering & Depth Normalization (`load_and_normalize`)
+### Loading, subsetting, and normalizing
 
-For IVCSR-backed datasets, `vsparse.load_and_normalize` bypasses full array decompression for rapid preprocessing, reproducing the filtering and depth normalization from `parafac2.normalize.prepare_dataset`:
-
-- **Cell filtering without decoding**: Computes cell totals in $O(n_{\text{unique}})$ time directly from group sizes without unpacking varint indices.
-- **Fused filter & normalization**: Performs gene filtering, cell/gene depth-scaling, and $\log_{10}(1000x + 1)$ transform in parallel passes over the compact CSR representation.
+Loading, subsetting, and normalization are separate steps, so they can be mixed and matched. `vsparse.load_packed` decodes an IVCSR/IVCSC-stored `.h5ad` into a `VCSCAnnData`; normalization is then a view over the stored array (`.normalized("parafac2")` reproduces `parafac2.normalize.prepare_dataset`'s depth normalization and log10 transform) that is never materialized.
 
 ```python
-adata_norm = vsparse.load_and_normalize(
-    "archived.h5ad",
-    min_cell_counts=10.0,  # Filter cells with counts <= 10
-    gene_threshold=0.05,  # Filter genes with counts <= 0.05 * n_cells
-)
+va = vsparse.load_packed("archived.h5ad")
+norm = va.X.normalized("parafac2")  # lazy view; norm @ B works without densifying
 ```
 
 ### CUDA (`to_gpu`)
