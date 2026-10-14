@@ -108,7 +108,7 @@ va = vsparse.VCSCAnnData.from_anndata(adata)  # Compresses X and raw.X
 va.X  # VCSCArray
 va.raw_X  # VCSCArray (separate from anndata's .raw)
 
-# Persist to HDF5 (.h5ad) or Zarr with default Blosc2+LZ4 compression
+# Persist to HDF5 (.h5ad) or Zarr with default zstd compression
 # (stored as IVCSC/IVCSR, see below)
 va.write_h5ad("compressed.h5ad")  # Read back with VCSCAnnData.read_h5ad
 va2 = vsparse.VCSCAnnData.read_h5ad("compressed.h5ad")

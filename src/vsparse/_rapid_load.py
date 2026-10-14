@@ -61,6 +61,7 @@ from scipy.sparse import csr_array
 
 from vsparse import _ivcsc
 from vsparse._anndata_class import VCSCAnnData
+from vsparse._compression import read_array
 from vsparse._indexutils import smallest_index_dtype
 from vsparse._ops import accumulator_threads
 
@@ -451,10 +452,10 @@ def _read_ivcsr_group(
     g = f[x_key]
     shape = (int(g.attrs["shape"][0]), int(g.attrs["shape"][1]))
     indices_dtype = np.dtype(g.attrs["indices_dtype"])
-    major_ptr = g["major_ptr"][...]
-    values = g["values"][...]
-    value_ptr = g["value_ptr"][...]
-    packed = g["packed_indices"][...]
+    major_ptr = read_array(g["major_ptr"])
+    values = read_array(g["values"])
+    value_ptr = read_array(g["value_ptr"])
+    packed = read_array(g["packed_indices"])
 
     kwargs = {k: ad.io.read_elem(f[k]) for k in _FIELD_KEYS if k in f}
     if "raw" in f:
@@ -527,7 +528,7 @@ def load_and_normalize(
         )
     """
     import h5py
-    import hdf5plugin  # noqa: F401  -- registers the Blosc2 HDF5 filter
+    import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
 
     _validate_min_cells(min_cells)
 
@@ -600,7 +601,7 @@ def load_packed(path: str | PathLike[str], *, x_key: str = "X") -> VCSCAnnData:
         Top-level h5ad group holding the IVCSR/IVCSC array (``"X"`` by default).
     """
     import h5py
-    import hdf5plugin  # noqa: F401  -- registers the Blosc2 HDF5 filter
+    import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
 
     with h5py.File(Path(path), "r") as f:
         X = ad.io.read_elem(f[x_key])

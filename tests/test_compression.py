@@ -10,16 +10,16 @@ from vsparse import _compression
 
 
 def test_h5_dataset_kwargs_options():
-    """Verify h5_dataset_kwargs correctly builds filter parameters."""
-    blosc_kwargs = _compression.h5_dataset_kwargs()
-    assert "compression" in blosc_kwargs
-    assert "compression_opts" in blosc_kwargs
+    """Verify h5_dataset_kwargs selects the zstd filter at level 1."""
+    kwargs = _compression.h5_dataset_kwargs()
+    assert kwargs["compression"] == _compression._H5_ZSTD_FILTER_ID
+    assert tuple(kwargs["compression_opts"]) == (1,)
 
 
 def test_zarr_dataset_kwargs_options():
     """Verify zarr_dataset_kwargs correctly builds compressor dict."""
-    blosc_kwargs = _compression.zarr_dataset_kwargs()
-    assert "compressor" in blosc_kwargs or "codecs" in blosc_kwargs
+    kwargs = _compression.zarr_dataset_kwargs()
+    assert "zstd" in type(kwargs["compressor"]).__name__.lower()
 
 
 def test_numeric_only_compression_invalid_backend():
@@ -55,7 +55,7 @@ def test_numeric_only_compression_skips_strings(tmp_path):
         f.create_dataset("strings", data=np.array(["a", "b", "c"], dtype=object), **kwargs)
 
     with h5py.File(path, "r") as f:
-        # Numeric dataset has blosc2 filter
-        assert any(int(fid) >= 32000 for fid in f["numbers"]._filters)
+        # Numeric dataset has the zstd filter
+        assert str(_compression._H5_ZSTD_FILTER_ID) in f["numbers"]._filters
         # String dataset has no compression filters
         assert dict(f["strings"]._filters) == {}

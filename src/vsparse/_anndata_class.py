@@ -470,9 +470,10 @@ class VCSCAnnData(ad.AnnData):
             with fewer categories than rows are converted.
         dataset_kwargs
             Passed to ``h5py.Group.create_dataset`` for every array written.
-            Defaults to Blosc2+LZ4 compression; pass ``{}`` to store
-            uncompressed. Either way, compression is only ever applied to
-            numeric arrays -- see :func:`vsparse._compression.numeric_only_compression`.
+            Defaults to zstd (level 1) compression, which :meth:`read_h5ad`
+            decodes in parallel; pass ``{}`` to store uncompressed. Either
+            way, compression is only ever applied to numeric arrays -- see
+            :func:`vsparse._compression.numeric_only_compression`.
         """
         import h5py
 
@@ -490,8 +491,13 @@ class VCSCAnnData(ad.AnnData):
 
     @classmethod
     def read_h5ad(cls, filename: str | PathLike[str]) -> VCSCAnnData:
-        """Read a file written by :meth:`write_h5ad`."""
+        """Read a file written by :meth:`write_h5ad`.
+
+        Reads files compressed with the current zstd default and with the
+        Blosc2 default of earlier versions alike.
+        """
         import h5py
+        import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
 
         with h5py.File(filename, "r") as f:
             return cls._read_group(f)
@@ -508,7 +514,7 @@ class VCSCAnnData(ad.AnnData):
 
         See :meth:`write_h5ad` for the IVCSC/IVCSR storage format and
         ``convert_strings_to_categoricals``/``dataset_kwargs`` (including the numeric-only compression behavior);
-        the default compression here is Blosc+LZ4 via ``numcodecs``.
+        the default compression here is zstd (level 1) via ``numcodecs``.
         """
         import zarr
 

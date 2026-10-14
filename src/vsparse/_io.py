@@ -25,6 +25,7 @@ import zarr
 
 from vsparse import _ivcsc
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
+from vsparse._compression import read_array
 from vsparse._indexutils import smallest_index_dtype
 
 if TYPE_CHECKING:
@@ -60,7 +61,7 @@ def _make_read_vcs(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
         shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
         shape = (shape_vals[0], shape_vals[1])
-        arrays = {name: cast(np.ndarray, _reader.read_elem(elem[name])) for name in _ARRAY_KEYS}
+        arrays = {name: read_array(elem[name]) for name in _ARRAY_KEYS}
         return cls(
             shape,
             arrays["major_ptr"],
@@ -113,10 +114,10 @@ def _make_read_ivcs(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
         shape_vals = [int(s) for s in np.asarray(elem.attrs["shape"]).tolist()]
         shape = (shape_vals[0], shape_vals[1])
-        major_ptr = cast(np.ndarray, _reader.read_elem(elem["major_ptr"]))
-        values = cast(np.ndarray, _reader.read_elem(elem["values"]))
-        value_ptr = cast(np.ndarray, _reader.read_elem(elem["value_ptr"]))
-        packed = cast(np.ndarray, _reader.read_elem(elem["packed_indices"]))
+        major_ptr = read_array(elem["major_ptr"])
+        values = read_array(elem["values"])
+        value_ptr = read_array(elem["value_ptr"])
+        packed = read_array(elem["packed_indices"])
         dtype = np.dtype(cast(str, elem.attrs["indices_dtype"]))
         indices = _ivcsc.unpack_indices(value_ptr, packed, dtype)
         return cls(shape, major_ptr, values, value_ptr, indices)

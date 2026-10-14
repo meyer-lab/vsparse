@@ -145,9 +145,9 @@ def test_write_h5ad_default_compression(base_adata, tmp_path):
     import h5py
 
     with h5py.File(path, "r") as f:
-        # Blosc2 is registered as a dynamically-loaded HDF5 filter, so h5py
+        # zstd is registered as a dynamically-loaded HDF5 filter, so h5py
         # doesn't recognize it via `compression` -- check the raw filter id.
-        assert any(int(fid) >= 32000 for fid in f["X"]["values"]._filters)
+        assert "32015" in f["X"]["values"]._filters
 
 
 def test_write_h5ad_dataset_kwargs_override(base_adata, tmp_path):
