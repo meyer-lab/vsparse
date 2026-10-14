@@ -60,6 +60,8 @@ _ZARR_V3_COMPRESSION_KEYS = ("compressors", "compressor")
 _ZSTD_LEVEL = 1
 # Registered HDF5 filter id for zstd (https://github.com/HDFGroup/hdf5_plugins).
 _H5_ZSTD_FILTER_ID = 32015
+# Chunk size for large compressed 1-D arrays -- see _chunk_large_1d.
+_H5_CHUNK_BYTES = 1 << 20
 
 
 def h5_dataset_kwargs() -> dict[str, Any]:
@@ -115,6 +117,23 @@ def _is_string_like(dtype: Any, data: Any) -> bool:
     return False
 
 
+def _chunk_large_1d(kwargs: dict[str, Any], data: Any) -> None:
+    """Give a compressed 1-D array larger than one chunk ~1 MiB chunks, unless chunks were chosen.
+
+    h5py's automatic chunking picks ~64-330 KiB chunks for the VCS arrays,
+    and :func:`read_array` pays a fixed, GIL-bound cost per chunk -- so
+    fewer, larger chunks read several times faster, at the same zstd ratio.
+    """
+    if "compression" not in kwargs or kwargs.get("chunks") is not None:
+        return
+    shape, dtype = getattr(data, "shape", None), getattr(data, "dtype", None)
+    if shape is None or dtype is None or len(shape) != 1:
+        return
+    per_chunk = max(1, _H5_CHUNK_BYTES // np.dtype(dtype).itemsize)
+    if shape[0] > per_chunk:
+        kwargs["chunks"] = (per_chunk,)
+
+
 @contextlib.contextmanager
 def _numeric_only_h5() -> Iterator[None]:
     import h5py
@@ -126,6 +145,8 @@ def _numeric_only_h5() -> Iterator[None]:
         if _is_string_like(kwargs.get("dtype"), data):
             for key in _H5_COMPRESSION_KEYS:
                 kwargs.pop(key, None)
+        else:
+            _chunk_large_1d(kwargs, data)
         return original(self, name, *args, **kwargs)
 
     h5py.Group.create_dataset = patched
@@ -176,11 +197,12 @@ def _numeric_only_zarr() -> Iterator[None]:
 
 
 def numeric_only_compression(store_kind: str) -> contextlib.AbstractContextManager[None]:
-    """Scoped patch making Blosc compression apply to numeric arrays only.
+    """Scoped patch making compression apply to numeric arrays only.
 
     ``store_kind`` is ``"h5"`` or ``"zarr"``. See the module docstring for why
-    this is needed. Use as ``with numeric_only_compression("h5"): ...`` around
-    the write.
+    this is needed. For HDF5 it also gives large compressed 1-D arrays ~1 MiB
+    chunks (see :func:`_chunk_large_1d`). Use as
+    ``with numeric_only_compression("h5"): ...`` around the write.
     """
     if store_kind == "h5":
         return _numeric_only_h5()
@@ -243,16 +265,26 @@ def _read_chunks_parallel(
 
     def load(i: int) -> None:
         raw = os.pread(fd, int(sizes[i]), int(offsets[i]))
-        # Filter-mask bit 0 set means HDF5 skipped zstd and stored the chunk as-is.
-        data = raw if masks[i] & 1 else codec.decode(raw)
         dst = flat[i * chunk_bytes : (i + 1) * chunk_bytes]
-        # The last chunk decodes to a full chunk; only its leading part is data.
-        dst[:] = np.frombuffer(data, dtype=np.uint8, count=dst.size)
+        if masks[i] & 1:  # filter-mask bit 0: HDF5 skipped zstd, stored the chunk as-is
+            dst[:] = np.frombuffer(raw, dtype=np.uint8, count=dst.size)
+        elif dst.size == chunk_bytes:
+            codec.decode(raw, out=dst)
+        else:  # the last chunk decodes to a full chunk; only its leading part is data
+            dst[:] = np.frombuffer(codec.decode(raw), dtype=np.uint8, count=dst.size)
+
+    # One contiguous run of chunks per thread, rather than one task per
+    # chunk, keeps the per-chunk (GIL-holding) Python overhead minimal.
+    n_workers = max(1, min(numba.get_num_threads(), offsets.shape[0]))
+    bounds = np.linspace(0, offsets.shape[0], n_workers + 1).astype(np.int64)
+
+    def load_run(t: int) -> None:
+        for i in range(bounds[t], bounds[t + 1]):
+            load(i)
 
     try:
-        n_workers = max(1, min(numba.get_num_threads(), offsets.shape[0]))
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            list(pool.map(load, range(offsets.shape[0])))
+            list(pool.map(load_run, range(n_workers)))
     finally:
         os.close(fd)
     return out

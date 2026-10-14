@@ -59,3 +59,27 @@ def test_numeric_only_compression_skips_strings(tmp_path):
         assert str(_compression._H5_ZSTD_FILTER_ID) in f["numbers"]._filters
         # String dataset has no compression filters
         assert dict(f["strings"]._filters) == {}
+
+
+def _written_chunks(tmp_path, data, **extra):
+    path = tmp_path / "chunks.h5"
+    with _compression.numeric_only_compression("h5"), h5py.File(path, "w") as f:
+        f.create_dataset("a", data=data, **_compression.h5_dataset_kwargs(), **extra)
+    with h5py.File(path, "r") as f:
+        return f["a"].chunks
+
+
+def test_large_1d_arrays_get_1mib_chunks(tmp_path):
+    """Compressed 1-D arrays larger than one chunk get ~1 MiB chunks for the parallel reader."""
+    for dtype in (np.uint8, np.int64):
+        per_chunk = (1 << 20) // np.dtype(dtype).itemsize
+        assert _written_chunks(tmp_path, np.zeros(3 * per_chunk + 7, dtype=dtype)) == (per_chunk,)
+
+
+def test_small_explicit_and_2d_chunks_untouched(tmp_path):
+    """Arrays that fit in one chunk, explicit chunks, and 2-D arrays keep h5py's choice."""
+    small = np.zeros(1000, dtype=np.int64)
+    big = np.zeros(1 << 20, dtype=np.int64)
+    assert _written_chunks(tmp_path, small) != ((1 << 20) // 8,)
+    assert _written_chunks(tmp_path, big, chunks=(4096,)) == (4096,)
+    assert len(_written_chunks(tmp_path, np.zeros((1 << 18, 4)))) == 2
