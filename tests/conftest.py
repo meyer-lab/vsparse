@@ -38,6 +38,35 @@ def csr(dense) -> sp.csr_array:
     return sp.csr_array(dense)
 
 
+@pytest.fixture
+def ivcs_file(tmp_path):
+    """Write a dense matrix to a packed ``.h5ad`` and hand back the path.
+
+    ``write(dense, format="csr", obs=..., var=...)``. The streaming readers are
+    tested against ``load_packed`` on the same file, so the fixture exists to
+    keep the two sides from drifting apart in how the file was written.
+    """
+    import anndata as ad
+
+    from vsparse import VCSCAnnData
+
+    count = 0
+
+    def write(dense, *, format="csr", obs=None, var=None, name=None):
+        nonlocal count
+        count += 1
+        adata = ad.AnnData(X=sp.csr_array(dense))
+        if obs is not None:
+            adata.obs = obs.set_index(adata.obs.index)
+        if var is not None:
+            adata.var = var.set_index(adata.var.index)
+        path = tmp_path / (name or f"data{count}.{format}.h5ad")
+        VCSCAnnData.from_anndata(adata, format=format).write_h5ad(path)
+        return path
+
+    return write
+
+
 #: Threads the memory-limited tests run their kernels with. Their accumulators
 #: are ``nthreads * n_minor * width * 8`` bytes, so an unpinned count would make
 #: the same ceiling mean something different on every machine.

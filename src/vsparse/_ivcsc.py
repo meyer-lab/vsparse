@@ -44,7 +44,7 @@ import numpy as np
 
 from vsparse._indexutils import smallest_index_dtype
 
-__all__ = ["pack_indices", "unpack_indices", "unpack_selected"]
+__all__ = ["pack_indices", "trim_to_boundary", "unpack_indices", "unpack_selected"]
 
 # Below this many packed bytes, decode serially -- the fixed overhead of the
 # counting pass plus a second (parallel) pass isn't worth it.
@@ -193,8 +193,27 @@ def _decode_chunks(
                 out[kk] = prev
 
 
+@numba.njit(cache=True)
+def trim_to_boundary(buf: np.ndarray) -> np.int64:
+    """Length of the longest prefix of ``buf`` that ends on a varint boundary.
+
+    Everything below takes a buffer whose last varint is complete, which is free
+    when the buffer is the whole stream and false for a window read out of the
+    middle of one. :func:`_count_varints_range` walks its inner
+    continuation-bit loop past ``end``, which on a truncated final varint reads
+    out of bounds -- `njit` without ``boundscheck`` will not stop it. So a
+    window that didn't come from the writer intact is trimmed here first.
+    """
+    n = buf.shape[0]
+    while n > 0 and (buf[n - 1] & 0x80) != 0:
+        n -= 1
+    return n
+
+
 def _varint_chunks(buf: np.ndarray, n_chunks: int) -> tuple[np.ndarray, np.ndarray]:
     """Split ``buf`` into ``n_chunks`` spans starting on varint boundaries.
+
+    ``buf`` must end on a varint boundary -- see :func:`trim_to_boundary`.
 
     Returns ``(real_starts, cum)``, each of length ``n_chunks + 1``: span ``t``
     covers bytes ``[real_starts[t], real_starts[t + 1])``, and its first varint
