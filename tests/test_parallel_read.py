@@ -1,4 +1,8 @@
-"""Tests for the parallel zstd chunk reader and its fallbacks (``_compression.read_array``)."""
+"""Tests for the parallel zstd chunk reader, its byte-range form, and their fallbacks.
+
+See ``vsparse._compression``: :func:`read_range` is the primitive,
+:func:`read_array` is it over a whole dataset.
+"""
 
 from __future__ import annotations
 
@@ -45,6 +49,60 @@ def test_parallel_read_matches(tmp_path, spy, dtype, n):
     assert out.dtype == data.dtype
     np.testing.assert_array_equal(out, data)
     assert spy == ["/a"]
+
+
+@pytest.mark.parametrize(
+    ("start", "stop"),
+    [
+        (0, 4321),  # the whole dataset
+        (0, 1),  # one element, first chunk
+        (999, 1001),  # across a chunk boundary
+        (1000, 2000),  # exactly one whole chunk
+        (1500, 4321),  # partial first chunk through the partial last one
+        (4320, 4321),  # last element
+        (2000, 2000),  # empty, mid-stream
+        (0, 0),  # empty, at the start
+    ],
+)
+def test_read_range_matches_slicing(tmp_path, spy, start, stop):
+    """A byte range decodes only the chunks that cover it, and matches h5py's slice."""
+    data = np.arange(4321, dtype=np.int64)
+    path = tmp_path / "r.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("a", data=data, chunks=(1000,), **ZSTD)
+    with h5py.File(path, "r") as f:
+        np.testing.assert_array_equal(
+            _compression.read_range(f["a"], start, stop), data[start:stop]
+        )
+    assert spy == ["/a"]
+
+
+def test_read_range_reuses_a_cached_chunk_table(tmp_path, spy):
+    """A caller streaming in windows builds the chunk table once and passes it back."""
+    data = np.arange(5000, dtype=np.int32)
+    path = tmp_path / "cached.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("a", data=data, chunks=(1000,), **ZSTD)
+    with h5py.File(path, "r") as f:
+        table = _compression.chunk_table(f["a"])
+        assert table is not None
+        for lo in range(0, 5000, 700):
+            np.testing.assert_array_equal(
+                _compression.read_range(f["a"], lo, lo + 700, table=table),
+                data[lo : lo + 700],
+            )
+    assert spy == ["/a"] * 8
+
+
+def test_chunk_table_is_none_for_other_layouts(tmp_path):
+    """``chunk_table`` is the eligibility test as well as the table."""
+    data = np.arange(1234, dtype=np.int64)
+    path = tmp_path / "plain.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("a", data=data)
+    with h5py.File(path, "r") as f:
+        assert _compression.chunk_table(f["a"]) is None
+        np.testing.assert_array_equal(_compression.read_range(f["a"], 10, 20), data[10:20])
 
 
 def test_userblock_offsets(tmp_path, spy):

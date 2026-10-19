@@ -11,10 +11,13 @@ support via ``numcodecs``.
 
 HDF5 runs a dataset's filter pipeline one chunk at a time on a single thread,
 which makes decompression, not I/O, the bottleneck on read.
-:func:`read_array` sidesteps that for zstd-filtered 1-D datasets: it looks up
+:func:`read_range` sidesteps that for zstd-filtered 1-D datasets: it looks up
 every chunk's file offset in one pass (``chunk_iter``), reads the compressed
 chunks itself, and decodes them on a thread pool (``numcodecs.Zstd`` releases
-the GIL). Anything else -- older Blosc2-compressed files, uncompressed or
+the GIL). :func:`read_array` is that over the whole dataset; a caller streaming
+a large array in windows reads one byte range at a time instead, and passes the
+:func:`chunk_table` back in so the ``chunk_iter`` pass isn't repeated per
+window. Anything else -- older Blosc2-compressed files, uncompressed or
 contiguous datasets, in-memory/non-POSIX drivers -- falls back to an ordinary
 h5py read, so those files keep loading exactly as before.
 
@@ -51,7 +54,17 @@ import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["h5_dataset_kwargs", "numeric_only_compression", "read_array", "zarr_dataset_kwargs"]
+#: Per-chunk ``(file offset, stored size, filter mask)``, as :func:`chunk_table` returns it.
+_ChunkTable = tuple[np.ndarray, np.ndarray, np.ndarray]
+
+__all__ = [
+    "chunk_table",
+    "h5_dataset_kwargs",
+    "numeric_only_compression",
+    "read_array",
+    "read_range",
+    "zarr_dataset_kwargs",
+]
 
 _H5_COMPRESSION_KEYS = ("compression", "compression_opts")
 _ZARR_V2_COMPRESSION_KEYS = ("compressor",)
@@ -228,13 +241,19 @@ def _is_parallel_zstd(ds: Any) -> bool:
     return plist.get_nfilters() == 1 and plist.get_filter(0)[0] == _H5_ZSTD_FILTER_ID
 
 
-def _chunk_table(ds: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+def chunk_table(ds: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     """Per-chunk ``(file offset, stored size, filter mask)``, in order.
 
-    ``None`` if any chunk was never written (HDF5 reads those as the fill
-    value, which only the ordinary read path reproduces) or this h5py/HDF5
-    build lacks ``chunk_iter``.
+    ``None`` if ``ds`` isn't eligible for the parallel path, if any chunk was
+    never written (HDF5 reads those as the fill value, which only the ordinary
+    read path reproduces), or if this h5py/HDF5 build lacks ``chunk_iter``.
+
+    Building it walks every chunk through a Python callback, so a caller making
+    repeated :func:`read_range` calls against one dataset should build it once
+    and pass it back in rather than pay that per window.
     """
+    if not _is_parallel_zstd(ds):
+        return None
     chunk_len = ds.chunks[0]
     n_chunks = -(-ds.shape[0] // chunk_len)
     offsets = np.full(n_chunks, -1, dtype=np.int64)
@@ -253,30 +272,35 @@ def _chunk_table(ds: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
 
 
 def _read_chunks_parallel(
-    ds: Any, offsets: np.ndarray, sizes: np.ndarray, masks: np.ndarray
+    ds: Any, offsets: np.ndarray, sizes: np.ndarray, masks: np.ndarray, lo: int, hi: int
 ) -> np.ndarray:
+    """Chunks ``[lo, hi)`` of ``ds``, decoded on a thread pool, as one flat array.
+
+    The result holds whole chunks, so it runs past the dataset's last element
+    when the final chunk is a partial one -- HDF5 stores that chunk padded to
+    full size, and trimming is the caller's business.
+    """
     import numcodecs
 
-    out = np.empty(ds.shape, dtype=ds.dtype)
+    chunk_len = ds.chunks[0]
+    out = np.empty((hi - lo) * chunk_len, dtype=ds.dtype)
     flat = out.view(np.uint8)
-    chunk_bytes = ds.chunks[0] * ds.dtype.itemsize
+    chunk_bytes = chunk_len * ds.dtype.itemsize
     codec = numcodecs.Zstd()
     fd = os.open(ds.file.filename, os.O_RDONLY)
 
     def load(i: int) -> None:
         raw = os.pread(fd, int(sizes[i]), int(offsets[i]))
-        dst = flat[i * chunk_bytes : (i + 1) * chunk_bytes]
+        dst = flat[(i - lo) * chunk_bytes : (i - lo + 1) * chunk_bytes]
         if masks[i] & 1:  # filter-mask bit 0: HDF5 skipped zstd, stored the chunk as-is
-            dst[:] = np.frombuffer(raw, dtype=np.uint8, count=dst.size)
-        elif dst.size == chunk_bytes:
+            dst[: len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+        else:
             codec.decode(raw, out=dst)
-        else:  # the last chunk decodes to a full chunk; only its leading part is data
-            dst[:] = np.frombuffer(codec.decode(raw), dtype=np.uint8, count=dst.size)
 
     # One contiguous run of chunks per thread, rather than one task per
     # chunk, keeps the per-chunk (GIL-holding) Python overhead minimal.
-    n_workers = max(1, min(numba.get_num_threads(), offsets.shape[0]))
-    bounds = np.linspace(0, offsets.shape[0], n_workers + 1).astype(np.int64)
+    n_workers = max(1, min(numba.get_num_threads(), hi - lo))
+    bounds = np.linspace(lo, hi, n_workers + 1).astype(np.int64)
 
     def load_run(t: int) -> None:
         for i in range(bounds[t], bounds[t + 1]):
@@ -290,6 +314,40 @@ def _read_chunks_parallel(
     return out
 
 
+def read_range(ds: Any, start: int, stop: int, *, table: _ChunkTable | None = None) -> np.ndarray:
+    """``ds[start:stop]``, decoding only the zstd chunks that cover it, in parallel.
+
+    Parameters
+    ----------
+    ds
+        An h5py dataset or zarr array.
+    start, stop
+        Half-open element range; ``stop`` is clipped to ``len(ds)``.
+    table
+        A :func:`chunk_table` for ``ds``, to avoid rebuilding it per call.
+        ``None`` builds one, which also decides whether the parallel path
+        applies at all -- a Blosc2-compressed, contiguous, or non-h5py dataset
+        falls back to an ordinary read of the same range.
+
+    ``chunk_table`` requires the file to be open read-only (see
+    :func:`_is_parallel_zstd`), so a range read taken while the file is open
+    ``"r+"`` silently drops to HDF5's single-threaded filter pipeline.
+    """
+    stop = min(int(stop), ds.shape[0])
+    start = int(start)
+    if table is None:
+        table = chunk_table(ds)
+    if table is None:
+        import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
+
+        return np.asarray(ds[start:stop])
+    chunk_len = ds.chunks[0]
+    lo = start // chunk_len
+    hi = max(lo, -(-stop // chunk_len))
+    buf = _read_chunks_parallel(ds, *table, lo, hi)
+    return buf[start - lo * chunk_len : stop - lo * chunk_len]
+
+
 def read_array(ds: Any) -> np.ndarray:
     """Read a whole dataset into memory, decoding zstd chunks in parallel where possible.
 
@@ -300,9 +358,4 @@ def read_array(ds: Any) -> np.ndarray:
     files written by earlier versions, is read the ordinary way. See the
     module docstring.
     """
-    table = _chunk_table(ds) if _is_parallel_zstd(ds) else None
-    if table is None:
-        import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
-
-        return np.asarray(ds[...])
-    return _read_chunks_parallel(ds, *table)
+    return read_range(ds, 0, ds.shape[0])
