@@ -408,6 +408,81 @@ def subset_load_vs_full_load() -> dict[str, float]:
     return out
 
 
+@slow
+def slab_stream_vs_full_decode() -> dict[str, float]:
+    """One pass over ``X`` in slabs, against decoding all of it, on a zstd IVCSR file.
+
+    Both read every packed byte front to back; the question is what each holds
+    while doing it. A full decode keeps the whole packed stream *and* the whole
+    decoded index array; the slab reader keeps one window and one block. The
+    throughput ratio is the thing to watch -- a windowed read re-decodes at most
+    one zstd chunk per window boundary, and if that overhead were large this
+    would be the wrong trade.
+
+    Memory is measured with ``tracemalloc`` rather than RSS: ``ru_maxrss`` is a
+    high-water mark that never falls, so on a fixture small enough to build
+    in-process it only ever reports the fixture. Timing and memory are measured
+    in separate passes, since tracing allocations distorts the timing of
+    allocation-heavy code.
+    """
+    import tempfile
+    import tracemalloc
+    from pathlib import Path as _Path
+
+    import anndata as ad
+    import h5py
+    import pandas as pd
+
+    from vsparse import VCSCAnnData, VCSRArray
+    from vsparse._stream import iter_blocks, open_packed, rows_per_window
+
+    n_obs, n_vars = 400_000, 3_000
+    mat = integer_counts_csr(n_obs, n_vars, density=0.02)
+    adata = VCSCAnnData(
+        X=VCSRArray.from_scipy(mat),
+        obs=pd.DataFrame(index=np.arange(n_obs).astype(str)),
+        var=pd.DataFrame(index=np.arange(n_vars).astype(str)),
+    )
+    nnz = float(mat.nnz)
+    del mat
+    out: dict[str, float] = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _Path(tmp) / "bench.ivcsr.h5ad"
+        adata.write_h5ad(path)
+        del adata
+        with h5py.File(path, "r") as f:
+            packed_bytes = float(f["X"]["packed_indices"].shape[0])
+            px = open_packed(f["X"])
+            chunk = rows_per_window(px)
+
+            def stream() -> None:
+                for _lo, _hi, block in iter_blocks(px, chunk_size=chunk):
+                    block.indices[0:1]  # touch it, so nothing is optimized away
+
+            full = best_time(lambda: ad.io.read_elem(f["X"]), repeat=3)
+            slab = best_time(stream, repeat=3)
+
+            tracemalloc.start()
+            ad.io.read_elem(f["X"])
+            full_peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.reset_peak()
+            stream()
+            slab_peak = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+
+    out["full_decode_seconds"] = full
+    out["slab_stream_seconds"] = slab
+    out["full_decode_gb_per_second"] = packed_bytes / 1e9 / full
+    out["slab_stream_gb_per_second"] = packed_bytes / 1e9 / slab
+    out["slab_time_ratio_over_full"] = slab / full
+    out["full_decode_peak_gb"] = full_peak / 1e9
+    out["slab_stream_peak_gb"] = slab_peak / 1e9
+    out["slab_peak_ratio_over_full"] = slab_peak / full_peak
+    out["bytes_per_nonzero_read"] = packed_bytes / nnz
+    out["rows_per_window"] = float(chunk)
+    return out
+
+
 # -- CUDA kernels vs materializing to a sparse matrix ------------------------
 #
 # The question `vsparse._cuda` exists to answer: is walking the

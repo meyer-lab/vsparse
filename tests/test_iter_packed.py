@@ -67,14 +67,34 @@ def test_a_wide_matrix_needs_more_bytes_than_elements(ivcs_file, rng):
     )
 
 
-@pytest.mark.parametrize("window_elems", [1, 2, 5, 40, 1 << 20])
-def test_a_row_subset_spans_however_many_windows(path, dense25, window_elems):
-    """``read_rows`` carries only (row, byte) across windows, at any window size."""
-    rows = np.array([0, 1, 7, 8, 11, 24])
+@pytest.mark.parametrize("chunk_size", [1, 4, 25])
+def test_the_cursor_accounts_for_every_byte(path, dense25, chunk_size):
+    """Blocks partition the stream exactly -- the cursor ends on its last byte.
+
+    This is what catches an off-by-one in locating where the next slice starts:
+    a window one varint short or long still decodes its own block correctly, but
+    the byte total at the end will not land on ``len(packed_indices)``.
+    """
     with h5py.File(path, "r") as f:
         px = _stream.open_packed(f["X"])
-        got = _stream.read_rows(px, rows, window_elems=window_elems)
-    np.testing.assert_array_equal(got.toarray(), dense25[rows])
+        cursor = _stream._Cursor(px)
+        for row_lo in range(0, px.n_major, chunk_size):
+            cursor.read_rows(min(row_lo + chunk_size, px.n_major))
+        assert cursor.row == px.n_major
+        assert cursor.byte == px.packed.shape[0]
+
+        for row_lo, row_hi, block in _stream.iter_blocks(px, chunk_size=chunk_size):
+            np.testing.assert_array_equal(block.toarray(), dense25[row_lo:row_hi])
+
+
+def test_rows_per_window_covers_the_matrix_in_a_few_blocks(path):
+    """Sized by elements, so a dense file gets fewer rows per window than a sparse one."""
+    with h5py.File(path, "r") as f:
+        px = _stream.open_packed(f["X"])
+        per_window = _stream.rows_per_window(px)
+    assert per_window >= 1
+    # This fixture is far smaller than one window, so one block covers it.
+    assert per_window >= px.n_major
 
 
 def test_an_all_zero_matrix_streams(ivcs_file):

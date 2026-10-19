@@ -103,6 +103,39 @@ def _map_subset_2d(mapping: Mapping[Any, Any], oidx: Any, vidx: Any) -> dict[Any
     return {k: _subset_2d(v, oidx, vidx) for k, v in mapping.items() if k is not None}
 
 
+def subset_fields(fields: Mapping[str, Any], oidx: Any, vidx: Any) -> dict[str, Any]:
+    """Window a set of AnnData fields to positions ``oidx``/``vidx``.
+
+    Behind :meth:`VCSCAnnData._subset_fields`, and used directly by
+    :func:`vsparse.iter_packed`, which windows fields it read straight from a
+    file rather than off an existing object. Fields absent from ``fields`` are
+    absent from the result, so a file without e.g. ``layers`` is fine.
+
+    ``obs["vsparse_a"]``/``varm["vsparse_b"/"c"/"s"]`` get windowed along with
+    ``obs``/``varm``, same as any other per-cell/per-gene column -- each kept
+    cell/gene keeps its own precomputed factor. But population-level aspects of
+    those statistics (e.g. the median depth or per-gene mean baked into them)
+    were derived from the *pre-subset* population, so they no longer reflect
+    this narrower one -- mark them stale rather than silently pretending they
+    were computed fresh. Call ``.normalized(recalculate=True)`` to recompute for
+    this subset, or ``recalculate=False`` to keep using these (stale) values.
+    """
+    out = dict(fields)
+    for key, idx in (("obs", oidx), ("var", vidx)):
+        if key in out:
+            out[key] = cast(pd.DataFrame, out[key]).iloc[idx].copy()
+    for key, idx in (("obsm", oidx), ("varm", vidx)):
+        if key in out:
+            out[key] = _map_subset_1d(out[key], idx)
+    for key, (i, j) in (("obsp", (oidx, oidx)), ("varp", (vidx, vidx)), ("layers", (oidx, vidx))):
+        if key in out:
+            out[key] = _map_subset_2d(out[key], i, j)
+    uns = out.get("uns") or {}
+    if _VSPARSE_UNS_KEY in uns:
+        out["uns"] = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
+    return out
+
+
 def _map_copy(mapping: Mapping[Any, Any]) -> dict[Any, Any]:
     return {k: _copy_value(v) for k, v in mapping.items() if k is not None}
 
@@ -224,32 +257,7 @@ class VCSCAnnData(ad.AnnData):
         Shared by :meth:`__getitem__` and :func:`~vsparse.load_packed`'s
         ``obs_idx``/``var_idx``, which decodes ``X`` already subset.
         """
-        obs = cast(pd.DataFrame, self.obs).iloc[oidx].copy()
-        var = cast(pd.DataFrame, self.var).iloc[vidx].copy()
-
-        # obs["vsparse_a"]/varm["vsparse_b"/"c"/"s"] get windowed along with
-        # obs/varm below, same as any other per-cell/per-gene column -- each
-        # kept cell/gene keeps its own precomputed factor. But population-level
-        # aspects of those statistics (e.g. the median depth or per-gene mean
-        # baked into them) were derived from the *pre-subset* population, so
-        # they no longer reflect this narrower one -- mark them stale rather
-        # than silently pretending they were computed fresh. Call
-        # .normalized(recalculate=True) to recompute for this subset, or
-        # recalculate=False to keep using these (stale) values.
-        uns = self.uns
-        if _VSPARSE_UNS_KEY in uns:
-            uns = {**uns, _VSPARSE_UNS_KEY: {**uns[_VSPARSE_UNS_KEY], "stale": True}}
-
-        return {
-            "obs": obs,
-            "var": var,
-            "uns": uns,
-            "obsm": _map_subset_1d(self.obsm, oidx),
-            "varm": _map_subset_1d(self.varm, vidx),
-            "obsp": _map_subset_2d(self.obsp, oidx, oidx),
-            "varp": _map_subset_2d(self.varp, vidx, vidx),
-            "layers": _map_subset_2d(self.layers, oidx, vidx),
-        }
+        return subset_fields({k: getattr(self, k) for k in _FIELD_KEYS}, oidx, vidx)
 
     def copy(self) -> VCSCAnnData:  # ty: ignore[invalid-method-override]
         """A deep copy, preserving the VCSC/VCSR-backed ``X``/``raw_X``.

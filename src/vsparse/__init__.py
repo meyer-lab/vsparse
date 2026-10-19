@@ -13,6 +13,7 @@ from vsparse._cuda import CudaNormalizedView, cuda_is_available
 from vsparse._norm_common import RECIPES, Recipe
 from vsparse._rapid_load import load_packed
 from vsparse._stats import VCSStats
+from vsparse._stream import iter_packed
 from vsparse._vcs_norm import VCSCArrayNormalized, VCSRArrayNormalized
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "VCSStats",
     "cuda_is_available",
     "from_anndata",
+    "iter_packed",
     "load_packed",
     "to_layer",
 ]
