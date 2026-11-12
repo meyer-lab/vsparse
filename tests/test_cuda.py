@@ -141,8 +141,49 @@ def test_transfer_keeps_the_compressed_layout(mat, cls):
     assert arr.n_unique < arr.nnz  # the fixture does dedupe, so this is a real check
     assert gpu.nnz == arr.nnz
     # An expanded CSR would need 4 bytes of data + 4 of indices per nonzero,
-    # before either pointer array.
-    assert gpu.nbytes < 8 * arr.nnz
+    # before either pointer array. Narrowed uint16 indices and int32 pointers
+    # (two of them, at most one entry per nonzero) leave a good deal less.
+    assert gpu.nbytes < 6 * arr.nnz
+
+
+@pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
+def test_device_structure_is_narrowed(mat, cls):
+    gpu = cls.from_scipy(mat).normalized("raw").to_gpu()
+    assert gpu.indices.dtype == np.uint16
+    assert gpu.major_ptr.dtype == gpu.value_ptr.dtype == np.int32
+
+
+@pytest.mark.parametrize(
+    ("n_minor", "expected"),
+    [(1, np.uint16), (2**16, np.uint16), (2**16 + 1, np.uint32)],
+)
+def test_index_dtype_boundary(n_minor, expected):
+    from vsparse._cuda import _index_dtype
+
+    assert _index_dtype(n_minor) == np.dtype(expected)
+
+
+@pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
+@pytest.mark.parametrize("n_minor", [2**16, 2**16 + 1])
+def test_matmul_across_the_uint16_boundary(cls, n_minor):
+    """Indices at 65535 (still uint16) and past it (uint32) both multiply correctly."""
+    rng = np.random.default_rng(1)
+    shape = (20, n_minor) if cls is VCSRArray else (n_minor, 20)
+    dense = np.zeros(shape)
+    flat = rng.choice(dense.size, size=400, replace=False)
+    dense.flat[flat] = rng.integers(1, 5, size=400)
+    # Make sure the very last minor index is occupied.
+    if cls is VCSRArray:
+        dense[0, -1] = 3.0
+    else:
+        dense[-1, 0] = 3.0
+    nv = cls.from_scipy(sp.csr_array(dense)).normalized("raw")
+    gpu = nv.to_gpu()
+    assert gpu.indices.dtype == (np.uint16 if n_minor <= 2**16 else np.uint32)
+    other = rng.standard_normal((shape[1], 5))
+    assert_close(gpu @ other, nv @ other)
+    left = rng.standard_normal((4, shape[0]))
+    assert_close(left @ gpu, left @ nv)
 
 
 def test_stats_are_float32_on_device(mat):
