@@ -26,8 +26,8 @@ As on the host (:mod:`vsparse._vcs_matmul`), ``A_norm = Delta + 1 (x) (-c*s)``
 with ``Delta`` nonzero only on the stored entries, so only ``Delta @ B`` /
 ``B @ Delta`` need a kernel; the rank-1 term is a CuPy one-liner.
 
-Each of the four kernels is one warp per major slice, grid-strided. The warp's
-32 lanes split two ways: ``ww`` lanes (the smallest power of two at or above
+Each of the four kernels is one warp per major slice, grid-strided (or per
+*chunk* of a slice, see below). The warp's 32 lanes split two ways: ``ww`` lanes (the smallest power of two at or above
 the dense width, capped at 32) cover the width, and the remaining
 ``groups = 32 / ww`` lane-groups walk the slice's nonzeros in stride. A
 PARAFAC2-shaped width of 8 would otherwise leave 24 of 32 lanes idle on every
@@ -52,11 +52,33 @@ thousands, so a private copy each is out of the question, while float32
 scattered index is a cell id. The cost is that the misaligned kernels sum in
 nondeterministic order, so repeated runs can differ in the last bits. The
 aligned kernels are deterministic.
+
+Two things are chosen per launch, not per kernel, from profiling these kernels
+on a 60,000 x 2,000 matrix at 5% density (see ``benchmarks/cases.py``):
+
+- *Accumulators.* An aligned kernel keeps ``acc`` partial sums per lane, enough
+  for the width to be covered in one pass (:func:`_accumulators`). It used to
+  always keep four, predicated off past the width: at a width of 16 that was
+  three dead multiply-adds per nonzero and enough registers (50) to cap the SM
+  at four blocks, where one accumulator fits in 40 and allows six. The kernels
+  are compiled once per accumulator count in use, so each width gets its own.
+- *Chunks.* A matrix with few major slices -- a few thousand genes in a VCSC --
+  launches under one wave of warps, and a kernel that spends its time waiting
+  on gathers needs many resident warps to hide them: ``B @ VCSC`` (2,000
+  slices) achieved 48% occupancy where the kernel allowed 83%.
+  :func:`_split_factor` cuts each slice
+  into chunks of its nonzeros, one warp each, when that is the case. The aligned
+  kernels then write one partial row per chunk, summed afterwards in a fixed
+  order, so they stay deterministic; the misaligned ones just ``atomicAdd`` as
+  they already did. Matrices with enough slices keep the original one-warp-per-
+  slice kernel, a separate compilation, because the chunk bounds cost ~25% at
+  the widest widths for a split of one where they do nothing.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import functools
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 
@@ -77,13 +99,33 @@ _WARPS_PER_BLOCK = 8
 
 #: Width accumulators each lane may hold in the aligned kernels. A warp covers
 #: ``ww * _ACC_MAX`` columns of the dense operand per pass over the slice, so
-#: any width up to 128 is a single pass; wider needs one pass per chunk.
+#: any width up to 128 is a single pass; wider needs one pass per chunk. This
+#: is only the cap: the kernels are compiled once per accumulator count
+#: actually needed (see :func:`_accumulators`), so a width that needs one
+#: accumulator pays for one, not for four predicated-off ones.
 _ACC_MAX = 4
 
 #: Blocks to launch. Capped rather than one-per-slice so a matrix with millions
 #: of cells doesn't build an enormous grid for slices that are mostly empty;
 #: the kernels grid-stride, so any cap is correct.
 _MAX_BLOCKS = 4096
+
+#: Splitting a major slice across several warps. A matrix with few slices (a
+#: 2,000-gene VCSC, say) otherwise launches a few hundred blocks, under a
+#: single wave, and the kernels -- which spend their time waiting on gathers --
+#: need many resident warps to hide that. :func:`_split_factor` asks for about
+#: ``_TARGET_WARPS_PER_SM`` work items per SM (a couple of waves, so the tail
+#: balances), capped at ``_MAX_SPLIT`` chunks per slice and kept from cutting a
+#: slice below ``_MIN_CHUNK_NNZ`` nonzeros, where the per-chunk setup (a binary
+#: search) would cost more than the parallelism buys. And a slice is not split
+#: at all when ``ww`` (the lanes covering the width) is below ``_MIN_SPLIT_WW``:
+#: the other ``32 / ww`` lane-groups are already walking nonzeros side by side,
+#: so the warp is not short of loads in flight, and splitting measured 10-15%
+#: slower at widths 1-4 against 10-20% faster from width 6 up.
+_TARGET_WARPS_PER_SM = 128
+_MAX_SPLIT = 16
+_MIN_CHUNK_NNZ = 256
+_MIN_SPLIT_WW = 8
 
 
 def cuda_is_available() -> bool:
@@ -115,7 +157,6 @@ def _require_cupy() -> Any:
 # spelling each one out in full would be ~200 lines of near-identical CUDA.
 
 _PREAMBLE = f"""
-#define ACC_MAX {_ACC_MAX}
 #define FULL_MASK 0xffffffffu
 
 __device__ __forceinline__ float apply_g(const float x, const int g_code) {{
@@ -156,21 +197,68 @@ extern "C" __global__ void {name}(
     const long long n_major,
     const int width,
     const int ww,
-    const int groups)
+    const int groups,
+    const int split)
 """
 
-#: Per-warp lane bookkeeping and the grid-stride loop header, shared by both
-#: body templates. ``wl`` indexes the width, ``nl`` the lane-group.
-_WARP_SETUP = """
+#: Per-warp lane bookkeeping, shared by every variant. ``wl`` indexes the
+#: width, ``nl`` the lane-group.
+_WARP_HEAD = """
 {
     const int lane = threadIdx.x;
     const int wl = lane & (ww - 1);
     const int nl = lane / ww;
     const long long stride = (long long)gridDim.x * blockDim.y;
+"""
+
+#: Two ways to hand slices to warps, and the two walks that go with them. Each
+#: variant is a ``(slices, walk, orow)`` triple of source fragments; a kernel is
+#: compiled for one of them (see :func:`_build_source`).
+#:
+#: *Whole*: one warp per major slice, grid-strided -- the original scheme, and
+#: the right one whenever there are enough slices to fill the device.
+#:
+#: *Chunked*: a warp's unit of work is a (major slice, chunk) pair, ``split``
+#: chunks to a slice, so a matrix with few slices still fills the device. The
+#: chunk is a contiguous share ``[ks, ke)`` of the slice's *flat* index range,
+#: split by position rather than by value-run because the runs are wildly
+#: uneven (a count matrix is mostly one value). ``ustart`` is the run containing
+#: ``ks``, found by binary search over the slice's ``value_ptr`` entries; chunk
+#: 0 starts at the slice start and skips the search.
+#:
+#: They are separate kernels, not one with ``split == 1`` as the fast case,
+#: because the chunk bounds are not free: clipping every run to ``[ks, ke)`` and
+#: carrying ``ks``/``ke``/``ustart`` through the loop measured ~25% slower at a
+#: width of 128 (four accumulators, so register pressure shows), for a split of
+#: one where it does nothing.
+_SLICES_WHOLE = """
     for (long long maj = (long long)blockIdx.x * blockDim.y + threadIdx.y;
          maj < n_major; maj += stride) {
         const long long mstart = major_ptr[maj];
         const long long mstop = major_ptr[maj + 1];
+"""
+
+_SLICES_CHUNKED = """
+    const long long n_items = n_major * split;
+    for (long long item = (long long)blockIdx.x * blockDim.y + threadIdx.y;
+         item < n_items; item += stride) {
+        const long long maj = item / split;
+        const int chunk = (int)(item - maj * split);
+        const long long mstart = major_ptr[maj];
+        const long long mstop = major_ptr[maj + 1];
+        const long long kbeg = value_ptr[mstart];
+        const long long span = value_ptr[mstop] - kbeg;
+        const long long ks = kbeg + span * chunk / split;
+        const long long ke = kbeg + span * (chunk + 1) / split;
+        long long ustart = mstart;
+        if (ks > kbeg) {
+            long long lo = mstart, hi = mstop - 1;
+            while (lo < hi) {
+                const long long mid = lo + (hi - lo + 1) / 2;
+                if (value_ptr[mid] <= ks) lo = mid; else hi = mid - 1;
+            }
+            ustart = lo;
+        }
 """
 
 #: VCSR: the major slice is a row, so ``row_scale`` is uniform over it and the
@@ -207,7 +295,7 @@ _SCALES_MAJOR_IS_COL = {
 #: closes, and leaves ``mi`` (the minor index) and ``d`` (the ``Delta`` entry)
 #: in scope between them. Lane-group ``nl`` starts ``nl`` into each run and
 #: steps by ``groups``, so the groups split the run between them.
-_WALK_OPEN = """
+_WALK_WHOLE = """
             for (long long u = mstart; u < mstop; ++u) {{
                 const float v = values[u];
                 const long long kstop = value_ptr[u + 1];
@@ -215,16 +303,32 @@ _WALK_OPEN = """
                     const int mi = indices[kk];
 {delta}"""
 
+#: The same walk over this warp's chunk ``[ks, ke)`` only: it starts at the run
+#: containing ``ks``, stops at the first run starting at or past ``ke``, and
+#: clips the runs at either end to the chunk.
+_WALK_CHUNKED = """
+            for (long long u = ustart; u < mstop; ++u) {{
+                const long long ubeg = value_ptr[u];
+                if (ubeg >= ke) break;
+                const float v = values[u];
+                const long long kbegin = ubeg > ks ? ubeg : ks;
+                const long long uend = value_ptr[u + 1];
+                const long long kstop = uend < ke ? uend : ke;
+                for (long long kk = kbegin + nl; kk < kstop; kk += groups) {{
+                    const int mi = indices[kk];
+{delta}"""
+
 _WALK_CLOSE = """
                 }}
             }}"""
 
-#: Aligned: the warp owns output row ``maj``, so it accumulates the width in
-#: registers, reduces across lane-groups, and stores once. The dense operand is
-#: indexed by the per-nonzero minor index.
+#: Aligned: the warp owns output row ``maj`` (or, chunked, one partial row of
+#: it, ``split`` of them to a slice, summed afterwards in a fixed order), so it
+#: accumulates the width in registers, reduces across lane-groups, and stores
+#: once. The dense operand is indexed by the per-nonzero minor index.
 _BODY_ALIGNED = """
 {hoist}
-        float* const orow = out + maj * (long long)width;
+        float* const orow = out + {orow_index} * (long long)width;
         for (int cbase = 0; cbase < width; cbase += ww * ACC_MAX) {{
             float acc[ACC_MAX];
             #pragma unroll
@@ -280,26 +384,41 @@ _KERNELS = {
 }
 
 
-def _build_source() -> str:
-    """The full CUDA source: all four kernels, assembled from the fragments above."""
-    parts = [_PREAMBLE]
+def _build_source(acc: int, chunked: bool) -> str:
+    """The full CUDA source for ``acc`` width accumulators per lane.
+
+    All four kernels, assembled from the fragments above, for either the whole
+    or the chunked way of handing slices to warps. ``acc`` only matters to the
+    aligned kernels; the misaligned ones loop over the width instead.
+    """
+    slices, walk, orow_index = (
+        (_SLICES_CHUNKED, _WALK_CHUNKED, "(maj * split + chunk)")
+        if chunked
+        else (_SLICES_WHOLE, _WALK_WHOLE, "maj")
+    )
+    parts = [f"#define ACC_MAX {acc}\n", _PREAMBLE]
     for name, (body, scales) in _KERNELS.items():
         # The walk is spliced in before formatting, not passed to it, because
         # it carries a `{delta}` of its own that the same pass has to expand.
-        spliced = body.replace("{walk_open}", _WALK_OPEN).replace("{walk_close}", _WALK_CLOSE)
+        spliced = body.replace("{walk_open}", walk).replace("{walk_close}", _WALK_CLOSE)
         parts.append(_SIGNATURE.format(name=name))
-        parts.append(_WARP_SETUP)
-        parts.append(spliced.format(warp=_WARP, **scales))
+        parts.append(_WARP_HEAD)
+        parts.append(slices)
+        parts.append(spliced.format(warp=_WARP, orow_index=orow_index, **scales))
     return "".join(parts)
 
 
-_module_cache: Any = None
+_module_cache: dict[tuple[int, bool], Any] = {}
 
 
-def _module() -> Any:
-    """The compiled :class:`cupy.RawModule`, built once per process."""
-    global _module_cache
-    if _module_cache is None:
+def _module(acc: int, chunked: bool) -> Any:
+    """The compiled :class:`cupy.RawModule` for a variant, built once per process.
+
+    Variants are compiled lazily, so a process only pays for the accumulator
+    counts and slice schemes its matrices and widths actually reach.
+    """
+    key = (acc, chunked)
+    if key not in _module_cache:
         cp = _require_cupy()
         # --use_fast_math: measured 24% off the parafac2 kernel (every recipe
         # but "raw" puts a transcendental on every nonzero) while the worst
@@ -308,18 +427,64 @@ def _module() -> Any:
         # already committed to. Its denormal flushing is if anything the safer
         # behaviour here: a denormal `gene_scale` fails the `> 0.0f` guard and
         # its column is skipped, rather than dividing into an infinity.
-        _module_cache = cp.RawModule(code=_build_source(), options=("--use_fast_math",))
-    return _module_cache
+        source = _build_source(acc, chunked)
+        _module_cache[key] = cp.RawModule(code=source, options=("--use_fast_math",))
+    return _module_cache[key]
 
 
-def _launch_config(n_major: int, width: int) -> tuple[tuple[int], tuple[int, int], int, int]:
-    """``(grid, block, ww, groups)`` for a slice count and a dense width."""
+@functools.cache
+def _sm_count(device_id: int) -> int:
+    """Streaming multiprocessors on a device (cached: the attribute query is a driver call)."""
+    cp = _require_cupy()
+    attr = cp.cuda.runtime.cudaDevAttrMultiProcessorCount
+    return int(cp.cuda.runtime.deviceGetAttribute(attr, device_id))
+
+
+def _accumulators(width: int, ww: int) -> int:
+    """Accumulators a lane needs to cover ``width`` in one pass, capped at ``_ACC_MAX``."""
+    return min(_ACC_MAX, max(1, -(-width // ww)))
+
+
+def _split_factor(n_major: int, nnz: int, sm_count: int, ww: int) -> int:
+    """Chunks to cut each major slice into; 1 when the grid is already full or ``ww`` is narrow."""
+    if n_major <= 0 or ww < _MIN_SPLIT_WW:
+        return 1
+    wanted = -(-(sm_count * _TARGET_WARPS_PER_SM) // n_major)
+    affordable = nnz // (n_major * _MIN_CHUNK_NNZ)
+    return max(1, min(wanted, affordable, _MAX_SPLIT))
+
+
+class _Launch(NamedTuple):
+    """Everything a kernel launch needs beyond the data."""
+
+    grid: tuple[int]
+    block: tuple[int, int]
+    ww: int
+    groups: int
+    acc: int
+    split: int
+
+    @property
+    def chunked(self) -> bool:
+        """Whether slices are cut into chunks, which selects the chunked kernels."""
+        return self.split > 1
+
+
+def _launch_config(n_major: int, width: int, nnz: int, sm_count: int) -> _Launch:
+    """The launch for a slice count, a dense width, and a device of ``sm_count`` SMs."""
     ww = 1
     while ww < width and ww < _WARP:
         ww <<= 1
-    groups = _WARP // ww
-    blocks = min(_MAX_BLOCKS, max(1, -(-n_major // _WARPS_PER_BLOCK)))
-    return (blocks,), (_WARP, _WARPS_PER_BLOCK), ww, groups
+    split = _split_factor(n_major, nnz, sm_count, ww)
+    blocks = min(_MAX_BLOCKS, max(1, -(-(n_major * split) // _WARPS_PER_BLOCK)))
+    return _Launch(
+        (blocks,),
+        (_WARP, _WARPS_PER_BLOCK),
+        ww,
+        _WARP // ww,
+        _accumulators(width, ww),
+        split,
+    )
 
 
 # -- the device-resident view -------------------------------------------------
@@ -353,6 +518,7 @@ class CudaNormalizedView:
         "recipe",
         "row_scale",
         "shape",
+        "sm_count",
         "value_ptr",
         "values",
     )
@@ -363,6 +529,10 @@ class CudaNormalizedView:
         self._format = view._format
         self.shape = view.shape
         self.recipe = view.recipe
+        # Of the device the arrays below land on, read once: the launch plan
+        # needs it on every call, and asking the driver costs microseconds a
+        # kernel that takes a few hundred.
+        self.sm_count = _sm_count(cp.cuda.Device().id)
 
         # Structure. The pointer arrays index into `values`/`indices`, which can
         # exceed 2**31 entries, so they stay 64-bit; `indices` holds a row or
@@ -432,22 +602,34 @@ class CudaNormalizedView:
         )
 
     def _run(self, name: str, B: Any, out: Any, n_major: int) -> None:
+        cp = _require_cupy()
         width = int(B.shape[1])
-        grid, block, ww, groups = _launch_config(n_major, width)
-        kernel = _module().get_function(name)
+        cfg = _launch_config(n_major, width, self.nnz, self.sm_count)
+        # An aligned kernel stores rather than adds, so split chunks of one
+        # slice can't share its output row: each writes a partial row of its
+        # own (zero-initialised, so a skipped slice stays zero), and the
+        # partials are summed below. The sum is a fixed-order reduction, so
+        # the aligned direction stays deterministic. A misaligned kernel
+        # atomicAdds into `out` whatever the split, and needs no scratch.
+        scratch = _KERNELS[name][0] is _BODY_ALIGNED and cfg.chunked
+        target = cp.zeros((n_major * cfg.split, width), dtype=DEVICE_DTYPE) if scratch else out
+        kernel = _module(cfg.acc, cfg.chunked).get_function(name)
         kernel(
-            grid,
-            block,
+            cfg.grid,
+            cfg.block,
             (
                 *self._kernel_args(self.recipe.g_code),
                 B,
-                out,
+                target,
                 np.int64(n_major),
                 np.int32(width),
-                np.int32(ww),
-                np.int32(groups),
+                np.int32(cfg.ww),
+                np.int32(cfg.groups),
+                np.int32(cfg.split),
             ),
         )
+        if scratch:
+            cp.sum(target.reshape(n_major, cfg.split, width), axis=1, out=out)
 
     def __matmul__(self, other: Any) -> Any:
         """``self @ other`` for a dense ``other``; returns a float32 CuPy array."""
