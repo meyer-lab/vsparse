@@ -187,3 +187,155 @@ def test_degenerate_shapes_and_widths(shape, cls, width):
 
     assert_close(gpu @ np.ones((shape[1], width)), nv @ np.ones((shape[1], width)))
     assert_close(np.ones((width, shape[0])) @ gpu, np.ones((width, shape[0])) @ nv)
+
+
+# -- accumulator specialization and slice splitting ---------------------------
+#
+# The kernels are compiled once per (accumulators, chunked) pair, and a chunked
+# warp walks only its share of a slice. The matrices in this file are far too
+# small for `_split_factor` to ever choose a split by itself, so the tests below
+# force one, and separately pin down what the heuristic itself decides.
+
+
+@pytest.fixture
+def forced_split(monkeypatch):
+    """Make every launch cut each major slice into ``n`` chunks."""
+    from vsparse import _cuda
+
+    def force(n: int) -> None:
+        monkeypatch.setattr(_cuda, "_split_factor", lambda *_args: n)
+
+    return force
+
+
+def skewed_counts() -> sp.csr_array:
+    """Slices whose runs and sizes are as uneven as chunk bounds can be asked to handle.
+
+    Row 0 is dense and all one value (a single run the whole width of the
+    matrix), row 1 is empty, row 2 holds one entry, row 3 is two runs of very
+    different length, and the rest are sparse random counts. Column 5 is empty
+    too, so both layouts have empty and one-entry slices.
+    """
+    rng = np.random.default_rng(7)
+    dense = rng.integers(1, 4, size=(40, 30)).astype(np.float64)
+    dense[rng.random(dense.shape) > 0.15] = 0.0
+    dense[0, :] = 1.0
+    dense[1, :] = 0.0
+    dense[2, :] = 0.0
+    dense[2, 17] = 5.0
+    dense[3, :] = 1.0
+    dense[3, :4] = 2.0
+    dense[:, 5] = 0.0
+    return sp.csr_array(dense)
+
+
+@pytest.mark.parametrize("split", [2, 3, 7, 64])
+@pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
+@pytest.mark.parametrize("width", [1, 8, 32, 33, 65, 97, 130])
+@pytest.mark.parametrize("matrix", ["random", "skewed"])
+def test_split_slices_match_cpu(forced_split, mat, matrix, cls, width, split):
+    """Chunked kernels agree with the host in all four directions, at every accumulator count.
+
+    ``width`` covers each accumulator count (1 up to 4, and 130 for more than
+    one pass); ``split`` covers a handful of chunks and far more chunks than a
+    slice has nonzeros, where most chunks are empty. The skewed matrix puts the
+    chunk boundaries inside a single long run, on an empty slice and on a
+    one-entry slice.
+    """
+    a = mat if matrix == "random" else skewed_counts()
+    forced_split(split)
+    nv = cls.from_scipy(a).normalized("parafac2")
+    gpu = nv.to_gpu()
+    rng = np.random.default_rng(1)
+
+    B = rng.normal(size=(a.shape[1], width))
+    assert_close(gpu @ B, nv @ B)
+    C = rng.normal(size=(width, a.shape[0]))
+    assert_close(C @ gpu, C @ nv)
+
+
+@pytest.mark.parametrize("recipe", sorted(RECIPES))
+def test_split_slices_cover_every_recipe(forced_split, mat, recipe):
+    """The chunked walk computes ``Delta`` the same way for every ``g``."""
+    forced_split(4)
+    for cls in (VCSRArray, VCSCArray):
+        nv = cls.from_scipy(mat).normalized(recipe)
+        B = np.random.default_rng(1).normal(size=(mat.shape[1], 16))
+        assert_close(nv.to_gpu() @ B, nv @ B)
+
+
+def test_the_heuristic_splits_a_matrix_with_few_slices():
+    """No forcing: a tall, narrow VCSC is split by ``_split_factor`` itself, and still correct."""
+    from vsparse import _cuda
+
+    rng = np.random.default_rng(3)
+    a = counts(rng, (20_000, 64), density=0.3)
+    nv = VCSCArray.from_scipy(a).normalized("parafac2")
+    gpu = nv.to_gpu()
+    assert _cuda._launch_config(64, 16, gpu.nnz, gpu.sm_count).chunked
+
+    B = rng.normal(size=(a.shape[1], 16))
+    assert_close(gpu @ B, nv @ B)  # misaligned: split chunks atomicAdd into one output
+    C = rng.normal(size=(16, a.shape[0]))
+    assert_close(C @ gpu, C @ nv)  # aligned: split chunks write partial rows, then reduce
+
+
+@pytest.mark.parametrize(("cls", "side"), [(VCSRArray, "right"), (VCSCArray, "left")])
+def test_aligned_direction_stays_deterministic_when_split(forced_split, mat, cls, side):
+    """The aligned kernels' documented determinism survives splitting.
+
+    Partial rows are summed in a fixed order afterwards rather than
+    ``atomicAdd``ed, so two runs agree to the bit.
+    """
+    forced_split(5)
+    gpu = cls.from_scipy(mat).normalized("parafac2").to_gpu()
+    rng = np.random.default_rng(6)
+    if side == "right":  # VCSR @ B is aligned
+        B = rng.normal(size=(mat.shape[1], 16))
+        first, second = gpu @ B, gpu @ B
+    else:  # B @ VCSC is aligned
+        B = rng.normal(size=(16, mat.shape[0]))
+        first, second = B @ gpu, B @ gpu
+    assert np.array_equal(first.get(), second.get())
+
+
+@pytest.mark.parametrize(
+    ("width", "acc"),
+    [
+        (1, 1),
+        (3, 1),
+        (8, 1),
+        (16, 1),
+        (32, 1),
+        (33, 2),
+        (64, 2),
+        (65, 3),
+        (96, 3),
+        (97, 4),
+        (130, 4),
+    ],
+)
+def test_accumulator_count_follows_the_width(width, acc):
+    """A lane gets just enough accumulators for one pass, capped at ``_ACC_MAX``."""
+    from vsparse import _cuda
+
+    assert _cuda._launch_config(1000, width, 10**6, 84).acc == acc
+
+
+def test_split_factor_decisions():
+    """When the heuristic splits, and when it declines."""
+    from vsparse import _cuda
+
+    plan = _cuda._launch_config
+    full, nnz = 60_000, 6_000_000
+    assert plan(full, 16, nnz, 84).split == 1  # plenty of slices already
+    few = plan(2_000, 16, nnz, 84)
+    assert 1 < few.split <= _cuda._MAX_SPLIT  # starved grid: split
+    assert (
+        plan(2_000, 4, nnz, 84).split == 1
+    )  # narrow width: lane-groups already supply the parallelism
+    assert plan(2_000, 16, 2_000 * 10, 84).split == 1  # slices too short to cut
+    assert plan(0, 16, 0, 84).split == 1  # nothing to split
+    assert few.chunked and not plan(full, 16, nnz, 84).chunked
+    # The grid always covers every (slice, chunk) pair, up to the block cap.
+    assert few.grid[0] * few.block[1] >= min(2_000 * few.split, _cuda._MAX_BLOCKS * few.block[1])
