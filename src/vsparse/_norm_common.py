@@ -711,6 +711,14 @@ def _column_mean_scale(arr, recipe, row_scale, gene_scale):
     return col_mean, col_post_scale
 
 
+def _scipy_index_dtype(nnz: int, shape: tuple[int, ...]) -> type[np.signedinteger]:
+    """``np.int32`` when ``nnz`` and every dimension fit in it, else ``np.int64``.
+
+    int32 halves index memory and is what MKL's default LP64 interface needs.
+    """
+    return np.int32 if max(nnz, *shape) <= np.iinfo(np.int32).max else np.int64
+
+
 class NormalizedViewBase:
     """Shared implementation for the normalized VCSC/VCSR views.
 
@@ -929,8 +937,9 @@ class NormalizedViewBase:
         Parameters
         ----------
         dtype : numpy dtype-like, default ``np.float64``
-            Dtype of the returned array's ``data`` (values only -- indices
-            stay at their existing width). Pass e.g. ``np.float32`` to
+            Dtype of the returned array's ``data`` (values only; the index
+            arrays are always the smallest of int32/int64 that fits ``nnz``
+            and the shape, chosen automatically). Pass e.g. ``np.float32`` to
             materialize directly in a lower-precision dtype instead of
             materializing at float64 and downcasting afterwards, which
             briefly holds both the float64 and downcast copies in memory at
@@ -969,8 +978,13 @@ class NormalizedViewBase:
             )
             ctor = sp.csr_array
 
-        indptr = arr.value_ptr[arr.major_ptr]
-        return ctor((data, arr.indices, indptr), shape=self.shape)
+        # scipy promotes indices and indptr to a common width, so both must be
+        # narrowed together for int32 to survive; ``astype(copy=False)`` leaves
+        # ``arr.indices`` shared (no copy) when it is already the right width.
+        idx_dtype = _scipy_index_dtype(arr.nnz, self.shape)
+        indptr = arr.value_ptr[arr.major_ptr].astype(idx_dtype, copy=False)
+        indices = arr.indices.astype(idx_dtype, copy=False)
+        return ctor((data, indices, indptr), shape=self.shape)
 
     def to_gpu(self) -> Any:
         """This view, moved onto the current CUDA device -- see :mod:`vsparse._cuda`.

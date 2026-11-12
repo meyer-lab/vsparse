@@ -184,10 +184,10 @@ if _CUDA_G_CODES != _G_CODES:
 #: ``(*, width)`` and C-contiguous, whichever direction the product runs in.
 _SIGNATURE = """
 extern "C" __global__ void {name}(
-    const long long* __restrict__ major_ptr,
+    const ptr_t* __restrict__ major_ptr,
     const float* __restrict__ values,
-    const long long* __restrict__ value_ptr,
-    const int* __restrict__ indices,
+    const ptr_t* __restrict__ value_ptr,
+    const idx_t* __restrict__ indices,
     const float* __restrict__ row_scale,
     const float* __restrict__ gene_scale,
     const float* __restrict__ col_post_scale,
@@ -300,7 +300,22 @@ _WALK_WHOLE = """
                 const float v = values[u];
                 const long long kstop = value_ptr[u + 1];
                 for (long long kk = value_ptr[u] + nl; kk < kstop; kk += groups) {{
-                    const int mi = indices[kk];
+                    const unsigned int mi = indices[kk];
+{delta}"""
+
+#: The same walk over this warp's chunk ``[ks, ke)`` only: it starts at the run
+#: containing ``ks``, stops at the first run starting at or past ``ke``, and
+#: clips the runs at either end to the chunk.
+_WALK_CHUNKED = """
+            for (long long u = ustart; u < mstop; ++u) {{
+                const long long ubeg = value_ptr[u];
+                if (ubeg >= ke) break;
+                const float v = values[u];
+                const long long kbegin = ubeg > ks ? ubeg : ks;
+                const long long uend = value_ptr[u + 1];
+                const long long kstop = uend < ke ? uend : ke;
+                for (long long kk = kbegin + nl; kk < kstop; kk += groups) {{
+                    const unsigned int mi = indices[kk];
 {delta}"""
 
 #: The same walk over this warp's chunk ``[ks, ke)`` only: it starts at the run
@@ -384,8 +399,11 @@ _KERNELS = {
 }
 
 
-def _build_source(acc: int, chunked: bool) -> str:
+def _build_source(acc: int, chunked: bool, idx_t: str, ptr_t: str) -> str:
     """The full CUDA source for ``acc`` width accumulators per lane.
+
+    ``idx_t``/``ptr_t`` are the C types of the device ``indices`` and of the two
+    pointer arrays (see :func:`_index_dtype` and :func:`_pointer_dtype`).
 
     All four kernels, assembled from the fragments above, for either the whole
     or the chunked way of handing slices to warps. ``acc`` only matters to the
@@ -396,7 +414,10 @@ def _build_source(acc: int, chunked: bool) -> str:
         if chunked
         else (_SLICES_WHOLE, _WALK_WHOLE, "maj")
     )
-    parts = [f"#define ACC_MAX {acc}\n", _PREAMBLE]
+    parts = [
+        f"#define ACC_MAX {acc}\ntypedef {idx_t} idx_t;\ntypedef {ptr_t} ptr_t;\n",
+        _PREAMBLE,
+    ]
     for name, (body, scales) in _KERNELS.items():
         # The walk is spliced in before formatting, not passed to it, because
         # it carries a `{delta}` of its own that the same pass has to expand.
@@ -408,16 +429,34 @@ def _build_source(acc: int, chunked: bool) -> str:
     return "".join(parts)
 
 
-_module_cache: dict[tuple[int, bool], Any] = {}
+#: numpy dtype -> the C type the kernels see it as.
+_C_TYPES = {
+    np.dtype(np.uint16): "unsigned short",
+    np.dtype(np.uint32): "unsigned int",
+    np.dtype(np.int32): "int",
+    np.dtype(np.int64): "long long",
+}
+
+_module_cache: dict[tuple[int, bool, np.dtype, np.dtype], Any] = {}
 
 
-def _module(acc: int, chunked: bool) -> Any:
+def _index_dtype(n_minor: int) -> np.dtype:
+    """Narrowest unsigned dtype holding every minor index of an axis of this length."""
+    return np.dtype(np.uint16 if n_minor <= np.iinfo(np.uint16).max + 1 else np.uint32)
+
+
+def _pointer_dtype(max_entry: int) -> np.dtype:
+    """``int32`` when a pointer array's largest entry fits, else ``int64``."""
+    return np.dtype(np.int32 if max_entry <= np.iinfo(np.int32).max else np.int64)
+
+
+def _module(acc: int, chunked: bool, idx_dtype: np.dtype, ptr_dtype: np.dtype) -> Any:
     """The compiled :class:`cupy.RawModule` for a variant, built once per process.
 
     Variants are compiled lazily, so a process only pays for the accumulator
-    counts and slice schemes its matrices and widths actually reach.
+    counts, slice schemes and index/pointer widths its matrices actually reach.
     """
-    key = (acc, chunked)
+    key = (acc, chunked, idx_dtype, ptr_dtype)
     if key not in _module_cache:
         cp = _require_cupy()
         # --use_fast_math: measured 24% off the parafac2 kernel (every recipe
@@ -427,7 +466,7 @@ def _module(acc: int, chunked: bool) -> Any:
         # already committed to. Its denormal flushing is if anything the safer
         # behaviour here: a denormal `gene_scale` fails the `> 0.0f` guard and
         # its column is skipped, rather than dividing into an infinity.
-        source = _build_source(acc, chunked)
+        source = _build_source(acc, chunked, _C_TYPES[idx_dtype], _C_TYPES[ptr_dtype])
         _module_cache[key] = cp.RawModule(code=source, options=("--use_fast_math",))
     return _module_cache[key]
 
@@ -534,13 +573,17 @@ class CudaNormalizedView:
         # kernel that takes a few hundred.
         self.sm_count = _sm_count(cp.cuda.Device().id)
 
-        # Structure. The pointer arrays index into `values`/`indices`, which can
-        # exceed 2**31 entries, so they stay 64-bit; `indices` holds a row or
-        # column number and is narrowed to int32 for the kernels to share one
-        # signature (a 2**31-row matrix is far past what fits on a device).
-        self.major_ptr = cp.asarray(arr.major_ptr, dtype=cp.int64)
-        self.value_ptr = cp.asarray(arr.value_ptr, dtype=cp.int64)
-        self.indices = cp.asarray(arr.indices, dtype=cp.int32)
+        # Structure, narrowed to what the shape and counts need, since device
+        # memory is the point of this layout. `indices` holds a row or column
+        # number: uint16 when the minor axis is at most 2**16 long, else uint32.
+        # The pointers count into `values` (`major_ptr`) and `indices`
+        # (`value_ptr`); both share one dtype (one kernel type), sized for the
+        # larger count, nnz: int32 unless that exceeds 2**31 - 1.
+        n_minor = self.shape[1] if self._format == "csr" else self.shape[0]
+        self.indices = cp.asarray(arr.indices, dtype=_index_dtype(n_minor))
+        ptr_dtype = _pointer_dtype(len(arr.indices))
+        self.major_ptr = cp.asarray(arr.major_ptr, dtype=ptr_dtype)
+        self.value_ptr = cp.asarray(arr.value_ptr, dtype=ptr_dtype)
         self.values = cp.asarray(arr.values, dtype=DEVICE_DTYPE)
 
         # Statistics: O(n_rows + n_cols), negligible next to the structure.
@@ -613,7 +656,9 @@ class CudaNormalizedView:
         # atomicAdds into `out` whatever the split, and needs no scratch.
         scratch = _KERNELS[name][0] is _BODY_ALIGNED and cfg.chunked
         target = cp.zeros((n_major * cfg.split, width), dtype=DEVICE_DTYPE) if scratch else out
-        kernel = _module(cfg.acc, cfg.chunked).get_function(name)
+        kernel = _module(
+            cfg.acc, cfg.chunked, self.indices.dtype, self.major_ptr.dtype
+        ).get_function(name)
         kernel(
             cfg.grid,
             cfg.block,
@@ -704,18 +749,19 @@ class CudaNormalizedView:
 
         indptr = self.value_ptr[self.major_ptr]
         raw = cp.repeat(self.values, cp.diff(self.value_ptr))
+        indices = self.indices.astype(cp.int32)
         major = cp.repeat(cp.arange(len(indptr) - 1, dtype=cp.int32), cp.diff(indptr))
         if self._format == "csr":
-            row, col, ctor = major, self.indices, cps.csr_matrix
+            row, col, ctor = major, indices, cps.csr_matrix
         else:
-            row, col, ctor = self.indices, major, cps.csc_matrix
+            row, col, ctor = indices, major, cps.csc_matrix
 
         gs = self.gene_scale[col]
         scaled = cp.where(gs > 0, raw / self.row_scale[row] / gs, DEVICE_DTYPE(0))
         data = (self.col_post_scale[col] * _g_cupy(cp, scaled, self.recipe.g_code)).astype(
             DEVICE_DTYPE
         )
-        out = ctor((data, self.indices.astype(cp.int32), indptr.astype(cp.int32)), shape=self.shape)
+        out = ctor((data, indices, indptr.astype(cp.int32)), shape=self.shape)
         if format not in (None, "csr", "csc"):
             raise ValueError(f"format must be 'csr', 'csc' or None, got {format!r}")
         if format is not None and format != self._format:
