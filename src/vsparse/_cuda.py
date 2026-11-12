@@ -318,6 +318,21 @@ _WALK_CHUNKED = """
                     const unsigned int mi = indices[kk];
 {delta}"""
 
+#: The same walk over this warp's chunk ``[ks, ke)`` only: it starts at the run
+#: containing ``ks``, stops at the first run starting at or past ``ke``, and
+#: clips the runs at either end to the chunk.
+_WALK_CHUNKED = """
+            for (long long u = ustart; u < mstop; ++u) {{
+                const long long ubeg = value_ptr[u];
+                if (ubeg >= ke) break;
+                const float v = values[u];
+                const long long kbegin = ubeg > ks ? ubeg : ks;
+                const long long uend = value_ptr[u + 1];
+                const long long kstop = uend < ke ? uend : ke;
+                for (long long kk = kbegin + nl; kk < kstop; kk += groups) {{
+                    const int mi = indices[kk];
+{delta}"""
+
 _WALK_CLOSE = """
                 }}
             }}"""
