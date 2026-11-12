@@ -73,6 +73,12 @@ on a 60,000 x 2,000 matrix at 5% density (see ``benchmarks/cases.py``):
   they already did. Matrices with enough slices keep the original one-warp-per-
   slice kernel, a separate compilation, because the chunk bounds cost ~25% at
   the widest widths for a split of one where they do nothing.
+- *Vector loads.* The aligned kernels gather one dense-operand row per nonzero,
+  and when the width is a multiple of four they do it with ``float4`` loads
+  (:data:`_VECTOR_WIDTH`), so ``width / 4`` lanes cover the width. That is a
+  third compilation axis, and it shifts what "lanes across the width" means for
+  the accumulator count and the split threshold, which are both expressed in the
+  vector units actually loaded.
 """
 
 from __future__ import annotations
@@ -127,6 +133,15 @@ _MAX_SPLIT = 16
 _MIN_CHUNK_NNZ = 256
 _MIN_SPLIT_WW = 8
 
+#: The aligned kernels gather each dense-operand row with ``float4`` loads when
+#: the width is a multiple of this: a quarter of the load instructions, which
+#: measured 1.5-2.4x faster at widths 8-64 and ~10-30% at 128-256. CuPy
+#: allocations are 256-byte aligned, so with ``width * 4`` a multiple of 16
+#: bytes every row is too. Other widths keep scalar loads. The misaligned
+#: kernels stay scalar: ``atomicAdd(float4*)`` needs sm_90 and gained <10%,
+#: since the atomics, not the ``B`` loads, dominate them.
+_VECTOR_WIDTH = 4
+
 
 def cuda_is_available() -> bool:
     """Whether CuPy is importable and a CUDA device is actually present."""
@@ -164,6 +179,26 @@ __device__ __forceinline__ float apply_g(const float x, const int g_code) {{
     if (g_code == {G_LOG1P_1000X}) return log10f(1.0f + 1000.0f * x);
     if (g_code == {G_SQRT}) return x > 0.0f ? sqrtf(x) : 0.0f;
     return x;
+}}
+
+// The aligned kernels' inner loop is written once over a vector type VT: a
+// plain float, or a float4 when the width is a multiple of four (see VEC).
+__device__ __forceinline__ void fma_into(float& a, const float d, const float b) {{ a += d * b; }}
+__device__ __forceinline__ void fma_into(float4& a, const float d, const float4 b) {{
+    a.x += d * b.x; a.y += d * b.y; a.z += d * b.z; a.w += d * b.w;
+}}
+__device__ __forceinline__ float zero_of(float*) {{ return 0.0f; }}
+__device__ __forceinline__ float4 zero_of(float4*) {{ return make_float4(0.f, 0.f, 0.f, 0.f); }}
+__device__ __forceinline__ float shfl_down(const float a, const int off) {{
+    return __shfl_down_sync(FULL_MASK, a, off);
+}}
+__device__ __forceinline__ float4 shfl_down(const float4 a, const int off) {{
+    return make_float4(__shfl_down_sync(FULL_MASK, a.x, off), __shfl_down_sync(FULL_MASK, a.y, off),
+                       __shfl_down_sync(FULL_MASK, a.z, off), __shfl_down_sync(FULL_MASK, a.w, off));
+}}
+__device__ __forceinline__ void add_into(float& a, const float b) {{ a += b; }}
+__device__ __forceinline__ void add_into(float4& a, const float4 b) {{
+    a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
 }}
 """
 
@@ -328,17 +363,23 @@ _WALK_CLOSE = """
 #: once. The dense operand is indexed by the per-nonzero minor index.
 _BODY_ALIGNED = """
 {hoist}
-        float* const orow = out + {orow_index} * (long long)width;
-        for (int cbase = 0; cbase < width; cbase += ww * ACC_MAX) {{
-            float acc[ACC_MAX];
+        // VT is float, or float4 when VEC == 4: `width` is then a multiple of
+        // four and every row of B and of the output is 16-byte aligned, so each
+        // gather is one 128-bit load instead of four 32-bit ones. `wv` is the
+        // width in VT's, and `ww` counts lanes across those.
+        VT* const orow = (VT*)(out + {orow_index} * (long long)width);
+        const VT* const Bv = (const VT*)B;
+        const int wv = width / VEC;
+        for (int cbase = 0; cbase < wv; cbase += ww * ACC_MAX) {{
+            VT acc[ACC_MAX];
             #pragma unroll
-            for (int a = 0; a < ACC_MAX; ++a) acc[a] = 0.0f;
+            for (int a = 0; a < ACC_MAX; ++a) acc[a] = zero_of((VT*)0);
 {walk_open}
-                    const float* const brow = B + (long long)mi * width;
+                    const VT* const brow = Bv + (long long)mi * wv;
                     #pragma unroll
                     for (int a = 0; a < ACC_MAX; ++a) {{
                         const int c = cbase + a * ww + wl;
-                        if (c < width) acc[a] += d * brow[c];
+                        if (c < wv) fma_into(acc[a], d, brow[c]);
                     }}{walk_close}
 
             // Lanes sharing a `wl` sit `ww` apart, so folding by ww, 2*ww, ...
@@ -346,13 +387,13 @@ _BODY_ALIGNED = """
             #pragma unroll
             for (int a = 0; a < ACC_MAX; ++a) {{
                 for (int off = ww; off < {warp}; off <<= 1)
-                    acc[a] += __shfl_down_sync(FULL_MASK, acc[a], off);
+                    add_into(acc[a], shfl_down(acc[a], off));
             }}
             if (nl == 0) {{
                 #pragma unroll
                 for (int a = 0; a < ACC_MAX; ++a) {{
                     const int c = cbase + a * ww + wl;
-                    if (c < width) orow[c] = acc[a];
+                    if (c < wv) orow[c] = acc[a];
                 }}
             }}
         }}
@@ -384,19 +425,21 @@ _KERNELS = {
 }
 
 
-def _build_source(acc: int, chunked: bool) -> str:
-    """The full CUDA source for ``acc`` width accumulators per lane.
+def _build_source(acc: int, chunked: bool, vec: int) -> str:
+    """The full CUDA source for ``acc`` accumulators per lane, ``vec`` floats wide.
 
     All four kernels, assembled from the fragments above, for either the whole
     or the chunked way of handing slices to warps. ``acc`` only matters to the
-    aligned kernels; the misaligned ones loop over the width instead.
+    aligned kernels; the misaligned ones loop over the width instead and
+    ignore ``vec``.
     """
     slices, walk, orow_index = (
         (_SLICES_CHUNKED, _WALK_CHUNKED, "(maj * split + chunk)")
         if chunked
         else (_SLICES_WHOLE, _WALK_WHOLE, "maj")
     )
-    parts = [f"#define ACC_MAX {acc}\n", _PREAMBLE]
+    vt = "float4" if vec == 4 else "float"
+    parts = [f"#define ACC_MAX {acc}\n#define VEC {vec}\n#define VT {vt}\n", _PREAMBLE]
     for name, (body, scales) in _KERNELS.items():
         # The walk is spliced in before formatting, not passed to it, because
         # it carries a `{delta}` of its own that the same pass has to expand.
@@ -408,16 +451,16 @@ def _build_source(acc: int, chunked: bool) -> str:
     return "".join(parts)
 
 
-_module_cache: dict[tuple[int, bool], Any] = {}
+_module_cache: dict[tuple[int, bool, int], Any] = {}
 
 
-def _module(acc: int, chunked: bool) -> Any:
+def _module(acc: int, chunked: bool, vec: int) -> Any:
     """The compiled :class:`cupy.RawModule` for a variant, built once per process.
 
     Variants are compiled lazily, so a process only pays for the accumulator
     counts and slice schemes its matrices and widths actually reach.
     """
-    key = (acc, chunked)
+    key = (acc, chunked, vec)
     if key not in _module_cache:
         cp = _require_cupy()
         # --use_fast_math: measured 24% off the parafac2 kernel (every recipe
@@ -427,7 +470,7 @@ def _module(acc: int, chunked: bool) -> Any:
         # already committed to. Its denormal flushing is if anything the safer
         # behaviour here: a denormal `gene_scale` fails the `> 0.0f` guard and
         # its column is skipped, rather than dividing into an infinity.
-        source = _build_source(acc, chunked)
+        source = _build_source(acc, chunked, vec)
         _module_cache[key] = cp.RawModule(code=source, options=("--use_fast_math",))
     return _module_cache[key]
 
@@ -445,9 +488,13 @@ def _accumulators(width: int, ww: int) -> int:
     return min(_ACC_MAX, max(1, -(-width // ww)))
 
 
-def _split_factor(n_major: int, nnz: int, sm_count: int, ww: int) -> int:
-    """Chunks to cut each major slice into; 1 when the grid is already full or ``ww`` is narrow."""
-    if n_major <= 0 or ww < _MIN_SPLIT_WW:
+def _split_factor(n_major: int, nnz: int, sm_count: int, columns: int) -> int:
+    """Chunks to cut each major slice into; 1 when the grid is already full or ``columns`` is narrow.
+
+    ``columns`` is the dense columns the width lanes cover in one load: ``ww``
+    for scalar loads, ``4 * ww`` for float4 ones.
+    """
+    if n_major <= 0 or columns < _MIN_SPLIT_WW:
         return 1
     wanted = -(-(sm_count * _TARGET_WARPS_PER_SM) // n_major)
     affordable = nnz // (n_major * _MIN_CHUNK_NNZ)
@@ -463,6 +510,7 @@ class _Launch(NamedTuple):
     groups: int
     acc: int
     split: int
+    vec: int
 
     @property
     def chunked(self) -> bool:
@@ -470,20 +518,31 @@ class _Launch(NamedTuple):
         return self.split > 1
 
 
-def _launch_config(n_major: int, width: int, nnz: int, sm_count: int) -> _Launch:
-    """The launch for a slice count, a dense width, and a device of ``sm_count`` SMs."""
+def _launch_config(
+    n_major: int, width: int, nnz: int, sm_count: int, *, aligned: bool = False
+) -> _Launch:
+    """The launch for a slice count, a dense width, and a device of ``sm_count`` SMs.
+
+    ``aligned`` marks the register-accumulating kernels, which load ``float4``
+    when ``width`` is a multiple of four (:data:`_VECTOR_WIDTH`), so ``width / 4``
+    lanes cover the width. The misaligned kernels ``atomicAdd`` scalars and
+    always take ``vec == 1``.
+    """
+    vec = _VECTOR_WIDTH if aligned and width % _VECTOR_WIDTH == 0 else 1
+    lanes = width // vec
     ww = 1
-    while ww < width and ww < _WARP:
+    while ww < lanes and ww < _WARP:
         ww <<= 1
-    split = _split_factor(n_major, nnz, sm_count, ww)
+    split = _split_factor(n_major, nnz, sm_count, ww * vec)
     blocks = min(_MAX_BLOCKS, max(1, -(-(n_major * split) // _WARPS_PER_BLOCK)))
     return _Launch(
         (blocks,),
         (_WARP, _WARPS_PER_BLOCK),
         ww,
         _WARP // ww,
-        _accumulators(width, ww),
+        _accumulators(lanes, ww),
         split,
+        vec,
     )
 
 
@@ -604,16 +663,17 @@ class CudaNormalizedView:
     def _run(self, name: str, B: Any, out: Any, n_major: int) -> None:
         cp = _require_cupy()
         width = int(B.shape[1])
-        cfg = _launch_config(n_major, width, self.nnz, self.sm_count)
+        aligned = _KERNELS[name][0] is _BODY_ALIGNED
+        cfg = _launch_config(n_major, width, self.nnz, self.sm_count, aligned=aligned)
         # An aligned kernel stores rather than adds, so split chunks of one
         # slice can't share its output row: each writes a partial row of its
         # own (zero-initialised, so a skipped slice stays zero), and the
         # partials are summed below. The sum is a fixed-order reduction, so
         # the aligned direction stays deterministic. A misaligned kernel
         # atomicAdds into `out` whatever the split, and needs no scratch.
-        scratch = _KERNELS[name][0] is _BODY_ALIGNED and cfg.chunked
+        scratch = aligned and cfg.chunked
         target = cp.zeros((n_major * cfg.split, width), dtype=DEVICE_DTYPE) if scratch else out
-        kernel = _module(cfg.acc, cfg.chunked).get_function(name)
+        kernel = _module(cfg.acc, cfg.chunked, cfg.vec).get_function(name)
         kernel(
             cfg.grid,
             cfg.block,

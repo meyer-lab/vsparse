@@ -231,7 +231,7 @@ def skewed_counts() -> sp.csr_array:
 
 @pytest.mark.parametrize("split", [2, 3, 7, 64])
 @pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
-@pytest.mark.parametrize("width", [1, 8, 32, 33, 65, 97, 130])
+@pytest.mark.parametrize("width", [1, 4, 8, 12, 32, 33, 65, 97, 130, 256])
 @pytest.mark.parametrize("matrix", ["random", "skewed"])
 def test_split_slices_match_cpu(forced_split, mat, matrix, cls, width, split):
     """Chunked kernels agree with the host in all four directions, at every accumulator count.
@@ -339,3 +339,26 @@ def test_split_factor_decisions():
     assert few.chunked and not plan(full, 16, nnz, 84).chunked
     # The grid always covers every (slice, chunk) pair, up to the block cap.
     assert few.grid[0] * few.block[1] >= min(2_000 * few.split, _cuda._MAX_BLOCKS * few.block[1])
+
+
+@pytest.mark.parametrize(
+    ("width", "vec", "ww", "acc"),
+    [(1, 1, 1, 1), (6, 1, 8, 1), (4, 4, 1, 1), (8, 4, 2, 1), (16, 4, 4, 1), (128, 4, 32, 1),
+     (256, 4, 32, 2), (512, 4, 32, 4), (130, 1, 32, 4), (33, 1, 32, 2)],
+)  # fmt: skip
+def test_aligned_launch_uses_float4_for_multiples_of_four(width, vec, ww, acc):
+    """Aligned launches load ``float4`` when the width allows it; misaligned ones never do."""
+    from vsparse import _cuda
+
+    cfg = _cuda._launch_config(1000, width, 10**6, 84, aligned=True)
+    assert (cfg.vec, cfg.ww, cfg.acc) == (vec, ww, acc)
+    assert _cuda._launch_config(1000, width, 10**6, 84).vec == 1
+
+
+def test_vector_loads_do_not_change_when_a_narrow_matrix_splits():
+    """The split threshold counts columns, not lanes: width 8 splits as scalar or float4."""
+    from vsparse import _cuda
+
+    nnz = 6_000_000
+    assert _cuda._launch_config(2_000, 8, nnz, 84, aligned=True).split > 1
+    assert _cuda._launch_config(2_000, 4, nnz, 84, aligned=True).split == 1
