@@ -209,3 +209,21 @@ def test_means_property_matches_c_times_s(dense, vcls):
     v = vcls.from_scipy(_scipy_for(vcls, dense))
     nv = v.normalized()
     np.testing.assert_allclose(nv.means, nv.c * nv.s)
+
+
+def test_to_scipy_sparse_uses_int32_indices_when_they_fit(dense, vcls):
+    if dense.sum() == 0:
+        pytest.skip("all-zero matrix: median row total is 0")
+    v = vcls.from_scipy(_scipy_for(vcls, dense))
+    sparse = v.normalized().to_scipy_sparse()
+    assert sparse.indices.dtype == np.int32
+    assert sparse.indptr.dtype == np.int32
+
+
+def test_scipy_index_dtype_widens_only_when_needed():
+    from vsparse._norm_common import _scipy_index_dtype
+
+    big = np.iinfo(np.int32).max
+    assert _scipy_index_dtype(big, (10, 10)) is np.int32
+    assert _scipy_index_dtype(big + 1, (10, 10)) is np.int64
+    assert _scipy_index_dtype(5, (big + 1, 3)) is np.int64
