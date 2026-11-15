@@ -10,6 +10,7 @@ from benchmarks.harness import (
     best_gpu_time,
     best_time,
     integer_counts_csr,
+    skewed_counts_csr,
     ratio_vs_scipy,
 )
 
@@ -437,7 +438,7 @@ def subset_load_vs_full_load() -> dict[str, float]:
 _CUDA_ROWS, _CUDA_COLS, _CUDA_WIDTH = 60_000, 2_000, 16
 
 
-def _cuda_setup(cls_name: str, recipe: str):
+def _cuda_setup(cls_name: str, recipe: str, *, skewed: bool = False):
     """``(gpu_view, csr, means, mat)`` for a CUDA case.
 
     The baseline is deliberately the *best* materialized option, not the
@@ -450,7 +451,11 @@ def _cuda_setup(cls_name: str, recipe: str):
     """
     import vsparse
 
-    mat = integer_counts_csr(_CUDA_ROWS, _CUDA_COLS, density=0.05)
+    mat = (
+        skewed_counts_csr(_CUDA_ROWS, _CUDA_COLS, mean_nnz_per_row=100)
+        if skewed
+        else integer_counts_csr(_CUDA_ROWS, _CUDA_COLS, density=0.05)
+    )
     nv = getattr(vsparse, cls_name).from_scipy(mat).normalized(recipe)
     gpu = nv.to_gpu()
     return gpu, gpu.to_cupy_sparse(format="csr"), gpu.means, mat
@@ -474,30 +479,34 @@ def _cuda_metrics(gpu, csr, via_kernel, via_csr) -> dict[str, float]:
     }
 
 
-def _cuda_matmul_case(cls_name: str, recipe: str) -> Callable[[], dict[str, float]]:
+def _cuda_matmul_case(
+    cls_name: str, recipe: str, *, skewed: bool = False
+) -> Callable[[], dict[str, float]]:
     """``gpu @ B`` against ``csr @ B`` plus the same rank-1 correction."""
 
     def bench() -> dict[str, float]:
         import cupy as cp
 
-        gpu, csr, means, mat = _cuda_setup(cls_name, recipe)
+        gpu, csr, means, mat = _cuda_setup(cls_name, recipe, skewed=skewed)
         B = cp.asarray(
             np.random.default_rng(0).normal(size=(mat.shape[1], _CUDA_WIDTH)), dtype=cp.float32
         )
         return _cuda_metrics(gpu, csr, lambda: gpu @ B, lambda: csr @ B + (-means) @ B)
 
     direction = "matmul" if cls_name == "VCSRArray" else "matmul_misaligned"
-    bench.__name__ = f"cuda_{recipe}_{direction}_vs_csr"
+    bench.__name__ = f"cuda_{recipe}_{direction}{'_skewed' if skewed else ''}_vs_csr"
     return bench
 
 
-def _cuda_rmatmul_case(cls_name: str, recipe: str) -> Callable[[], dict[str, float]]:
+def _cuda_rmatmul_case(
+    cls_name: str, recipe: str, *, skewed: bool = False
+) -> Callable[[], dict[str, float]]:
     """``B @ gpu`` against ``B @ csr`` plus the same rank-1 correction."""
 
     def bench() -> dict[str, float]:
         import cupy as cp
 
-        gpu, csr, means, mat = _cuda_setup(cls_name, recipe)
+        gpu, csr, means, mat = _cuda_setup(cls_name, recipe, skewed=skewed)
         B = cp.asarray(
             np.random.default_rng(0).normal(size=(_CUDA_WIDTH, mat.shape[0])), dtype=cp.float32
         )
@@ -505,7 +514,7 @@ def _cuda_rmatmul_case(cls_name: str, recipe: str) -> Callable[[], dict[str, flo
         return _cuda_metrics(gpu, csr, lambda: B @ gpu, lambda: B @ csr + correction)
 
     direction = "rmatmul" if cls_name == "VCSCArray" else "rmatmul_misaligned"
-    bench.__name__ = f"cuda_{recipe}_{direction}_vs_csr"
+    bench.__name__ = f"cuda_{recipe}_{direction}{'_skewed' if skewed else ''}_vs_csr"
     return bench
 
 
@@ -521,6 +530,10 @@ def _register_cuda_benchmarks() -> None:
     cuda(_cuda_rmatmul_case("VCSCArray", "parafac2"))
     cuda(_cuda_matmul_case("VCSCArray", "parafac2"))
     cuda(_cuda_rmatmul_case("VCSRArray", "parafac2"))
+    # Real count matrices are skewed (a few genes in most cells), which leaves a
+    # VCSC with a few giant slices; the uniform matrix above cannot show that.
+    for skewed_case in (_cuda_rmatmul_case, _cuda_matmul_case):
+        cuda(skewed_case("VCSCArray", "parafac2", skewed=True))
 
 
 _register_cuda_benchmarks()

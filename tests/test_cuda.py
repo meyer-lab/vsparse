@@ -234,17 +234,17 @@ def test_degenerate_shapes_and_widths(shape, cls, width):
 #
 # The kernels are compiled once per (accumulators, chunked) pair, and a chunked
 # warp walks only its share of a slice. The matrices in this file are far too
-# small for `_split_factor` to ever choose a split by itself, so the tests below
-# force one, and separately pin down what the heuristic itself decides.
+# small for `_chunk_nnz` to ever cut a slice by itself, so the tests below
+# force a chunk size, and separately pin down what the heuristic itself decides.
 
 
 @pytest.fixture
 def forced_split(monkeypatch):
-    """Make every launch cut each major slice into ``n`` chunks."""
+    """Make every launch cut each major slice into chunks of ``n`` nonzeros."""
     from vsparse import _cuda
 
     def force(n: int) -> None:
-        monkeypatch.setattr(_cuda, "_split_factor", lambda *_args: n)
+        monkeypatch.setattr(_cuda, "_chunk_nnz", lambda *_args: n)
 
     return force
 
@@ -270,21 +270,21 @@ def skewed_counts() -> sp.csr_array:
     return sp.csr_array(dense)
 
 
-@pytest.mark.parametrize("split", [2, 3, 7, 64])
+@pytest.mark.parametrize("chunk", [1, 3, 7, 64])
 @pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
 @pytest.mark.parametrize("width", [1, 4, 8, 12, 32, 33, 65, 97, 130, 256])
 @pytest.mark.parametrize("matrix", ["random", "skewed"])
-def test_split_slices_match_cpu(forced_split, mat, matrix, cls, width, split):
+def test_split_slices_match_cpu(forced_split, mat, matrix, cls, width, chunk):
     """Chunked kernels agree with the host in all four directions, at every accumulator count.
 
     ``width`` covers each accumulator count (1 up to 4, and 130 for more than
-    one pass); ``split`` covers a handful of chunks and far more chunks than a
-    slice has nonzeros, where most chunks are empty. The skewed matrix puts the
+    one pass); ``chunk`` runs from one nonzero per chunk (every nonzero its own
+    warp) to larger than most slices, which stay whole. The skewed matrix puts the
     chunk boundaries inside a single long run, on an empty slice and on a
     one-entry slice.
     """
     a = mat if matrix == "random" else skewed_counts()
-    forced_split(split)
+    forced_split(chunk)
     nv = cls.from_scipy(a).normalized("parafac2")
     gpu = nv.to_gpu()
     rng = np.random.default_rng(1)
@@ -298,7 +298,7 @@ def test_split_slices_match_cpu(forced_split, mat, matrix, cls, width, split):
 @pytest.mark.parametrize("recipe", sorted(RECIPES))
 def test_split_slices_cover_every_recipe(forced_split, mat, recipe):
     """The chunked walk computes ``Delta`` the same way for every ``g``."""
-    forced_split(4)
+    forced_split(40)
     for cls in (VCSRArray, VCSCArray):
         nv = cls.from_scipy(mat).normalized(recipe)
         B = np.random.default_rng(1).normal(size=(mat.shape[1], 16))
@@ -306,19 +306,53 @@ def test_split_slices_cover_every_recipe(forced_split, mat, recipe):
 
 
 def test_the_heuristic_splits_a_matrix_with_few_slices():
-    """No forcing: a tall, narrow VCSC is split by ``_split_factor`` itself, and still correct."""
-    from vsparse import _cuda
-
+    """No forcing: a tall, narrow VCSC is cut by ``_chunk_nnz`` itself, and still correct."""
     rng = np.random.default_rng(3)
     a = counts(rng, (20_000, 64), density=0.3)
     nv = VCSCArray.from_scipy(a).normalized("parafac2")
     gpu = nv.to_gpu()
-    assert _cuda._launch_config(64, 16, gpu.nnz, gpu.sm_count).chunked
+    cfg = _launch(gpu, 16)
+    assert gpu._plan(cfg.chunk_nnz).n_items > 64  # 64 slices, cut into many chunks
 
     B = rng.normal(size=(a.shape[1], 16))
-    assert_close(gpu @ B, nv @ B)  # misaligned: split chunks atomicAdd into one output
+    assert_close(gpu @ B, nv @ B)  # misaligned: chunks atomicAdd into one output
     C = rng.normal(size=(16, a.shape[0]))
-    assert_close(C @ gpu, C @ nv)  # aligned: split chunks write partial rows, then reduce
+    assert_close(C @ gpu, C @ nv)  # aligned: chunks write partial rows, then reduce
+
+
+def _launch(gpu, width: int, *, aligned: bool = True):
+    from vsparse import _cuda
+
+    return _cuda._launch_config(gpu.nnz, width, gpu.sm_count, aligned=aligned)
+
+
+@pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
+def test_a_giant_slice_is_cut_even_when_slices_are_plentiful(cls):
+    """One slice holding most nonzeros is chunked at any width; ordinary slices stay whole.
+
+    This is the skew case: a matrix with thousands of slices fills the device,
+    but one slice with a hundred thousand nonzeros would set the kernel's tail.
+    """
+    rng = np.random.default_rng(4)
+    dense = (rng.random((20_000, 300)) < 0.01) * rng.integers(1, 4, (20_000, 300)).astype(float)
+    dense[:, 7] = 1.0  # a gene in every cell: one 20,000-entry slice of a VCSC (a row, transposed)
+    a = sp.csr_array(dense.T if cls is VCSRArray else dense)
+    nv = cls.from_scipy(a).normalized("parafac2")
+    gpu = nv.to_gpu()
+    n_major = gpu.major_ptr.shape[0] - 1
+    for width in (1, 4, 16):
+        cfg = _launch(gpu, width)
+        plan = gpu._plan(cfg.chunk_nnz)
+        sizes = (plan.item_ke - plan.item_ks).get()
+        assert plan.n_items > n_major  # the giant slice was cut
+        assert sizes.max() <= cfg.chunk_nnz  # and no chunk exceeds the target
+        assert len(plan.multi_slice) < 5  # while the ordinary slices stayed whole
+
+    for width in (1, 4, 16):
+        B = rng.normal(size=(gpu.shape[1], width))
+        assert_close(gpu @ B, nv @ B)
+        C = rng.normal(size=(width, gpu.shape[0]))
+        assert_close(C @ gpu, C @ nv)
 
 
 @pytest.mark.parametrize(("cls", "side"), [(VCSRArray, "right"), (VCSCArray, "left")])
@@ -328,7 +362,7 @@ def test_aligned_direction_stays_deterministic_when_split(forced_split, mat, cls
     Partial rows are summed in a fixed order afterwards rather than
     ``atomicAdd``ed, so two runs agree to the bit.
     """
-    forced_split(5)
+    forced_split(40)
     gpu = cls.from_scipy(mat).normalized("parafac2").to_gpu()
     rng = np.random.default_rng(6)
     if side == "right":  # VCSR @ B is aligned
@@ -360,26 +394,18 @@ def test_accumulator_count_follows_the_width(width, acc):
     """A lane gets just enough accumulators for one pass, capped at ``_ACC_MAX``."""
     from vsparse import _cuda
 
-    assert _cuda._launch_config(1000, width, 10**6, 84).acc == acc
+    assert _cuda._launch_config(10**6, width, 84).acc == acc
 
 
-def test_split_factor_decisions():
-    """When the heuristic splits, and when it declines."""
+def test_chunk_size_decisions():
+    """The chunk size: device-filling at wide widths, only a tail bound at narrow ones."""
     from vsparse import _cuda
 
-    plan = _cuda._launch_config
-    full, nnz = 60_000, 6_000_000
-    assert plan(full, 16, nnz, 84).split == 1  # plenty of slices already
-    few = plan(2_000, 16, nnz, 84)
-    assert 1 < few.split <= _cuda._MAX_SPLIT  # starved grid: split
-    assert (
-        plan(2_000, 4, nnz, 84).split == 1
-    )  # narrow width: lane-groups already supply the parallelism
-    assert plan(2_000, 16, 2_000 * 10, 84).split == 1  # slices too short to cut
-    assert plan(0, 16, 0, 84).split == 1  # nothing to split
-    assert few.chunked and not plan(full, 16, nnz, 84).chunked
-    # The grid always covers every (slice, chunk) pair, up to the block cap.
-    assert few.grid[0] * few.block[1] >= min(2_000 * few.split, _cuda._MAX_BLOCKS * few.block[1])
+    nnz, sm = 6_000_000, 84
+    wide = _cuda._launch_config(nnz, 16, sm).chunk_nnz
+    assert wide == -(-nnz // (sm * _cuda._TARGET_WARPS_PER_SM))
+    assert _cuda._launch_config(nnz, 4, sm).chunk_nnz == wide * _cuda._NARROW_CHUNK_FACTOR
+    assert _cuda._launch_config(10, 16, sm).chunk_nnz == _cuda._MIN_CHUNK_NNZ  # never finer
 
 
 @pytest.mark.parametrize(
@@ -391,15 +417,16 @@ def test_aligned_launch_uses_float4_for_multiples_of_four(width, vec, ww, acc):
     """Aligned launches load ``float4`` when the width allows it; misaligned ones never do."""
     from vsparse import _cuda
 
-    cfg = _cuda._launch_config(1000, width, 10**6, 84, aligned=True)
+    cfg = _cuda._launch_config(10**6, width, 84, aligned=True)
     assert (cfg.vec, cfg.ww, cfg.acc) == (vec, ww, acc)
-    assert _cuda._launch_config(1000, width, 10**6, 84).vec == 1
+    assert _cuda._launch_config(10**6, width, 84).vec == 1
 
 
 def test_vector_loads_do_not_change_when_a_narrow_matrix_splits():
-    """The split threshold counts columns, not lanes: width 8 splits as scalar or float4."""
+    """The narrow-width rule counts columns, not lanes: width 8 is wide as scalar or float4."""
     from vsparse import _cuda
 
     nnz = 6_000_000
-    assert _cuda._launch_config(2_000, 8, nnz, 84, aligned=True).split > 1
-    assert _cuda._launch_config(2_000, 4, nnz, 84, aligned=True).split == 1
+    wide = _cuda._launch_config(nnz, 8, 84, aligned=True).chunk_nnz
+    assert wide == _cuda._launch_config(nnz, 8, 84).chunk_nnz
+    assert _cuda._launch_config(nnz, 4, 84, aligned=True).chunk_nnz > wide
