@@ -50,6 +50,26 @@ def integer_counts_csr(n_rows: int, n_cols: int, density: float, seed: int = 0) 
     return mat
 
 
+def skewed_counts_csr(
+    n_rows: int, n_cols: int, mean_nnz_per_row: int, seed: int = 0
+) -> sp.csr_array:
+    """Integer counts shaped like a real single-cell matrix, unlike the uniform one above.
+
+    Gene popularity is Zipf-distributed (a few genes in most cells, most in
+    few), cell depth is log-normal (heavy-tailed row lengths), and counts are
+    drawn by multinomial-style sampling, so most nonzeros equal 1.
+    """
+    rng = np.random.default_rng(seed)
+    gene_p = 1.0 / np.arange(1, n_cols + 1) ** 1.1
+    cell_p = rng.lognormal(0.0, 0.8, n_rows)
+    draws = int(n_rows * mean_nnz_per_row * 1.3)
+    rows = rng.choice(n_rows, size=draws, p=cell_p / cell_p.sum())
+    cols = rng.choice(n_cols, size=draws, p=gene_p / gene_p.sum())
+    mat = sp.coo_array((np.ones(draws), (rows, cols)), shape=(n_rows, n_cols)).tocsr()
+    mat.sum_duplicates()
+    return mat
+
+
 def best_gpu_time(fn: Callable[[], Any], repeat: int = 7) -> float:
     """Best wall-clock time over ``repeat`` runs of a CUDA call, in seconds.
 
