@@ -430,3 +430,49 @@ def test_vector_loads_do_not_change_when_a_narrow_matrix_splits():
     wide = _cuda._launch_config(nnz, 8, 84, aligned=True).chunk_nnz
     assert wide == _cuda._launch_config(nnz, 8, 84).chunk_nnz
     assert _cuda._launch_config(nnz, 4, 84, aligned=True).chunk_nnz > wide
+
+
+def _runs_ascending(arr) -> bool:
+    """Whether every value-run of ``arr.indices`` is ascending."""
+    idx, ptr = np.asarray(arr.indices, dtype=np.int64), np.asarray(arr.value_ptr)
+    bad = np.flatnonzero(idx[1:] < idx[:-1]) + 1  # position of each descent's second element
+    return bool(np.isin(bad, ptr).all())  # a descent is fine only on a run boundary
+
+
+@pytest.mark.parametrize("cls", [VCSRArray, VCSCArray])
+def test_stored_run_order_survives_ordinary_paths(mat, cls):
+    """Canonical construction, transpose and plain selection keep every run ascending.
+
+    The kernels (VCSC at width 1 to 2 especially) rely on this order, and
+    nothing else pins it.
+    """
+    arr = cls.from_scipy(mat)
+    assert _runs_ascending(arr)
+    assert _runs_ascending(arr.T)
+    assert _runs_ascending(arr[10:200])
+    assert _runs_ascending(arr[:, 5:70])
+
+
+@pytest.mark.parametrize("width", [1, 2, 8])
+def test_to_gpu_restores_run_order_after_row_permutation(mat, width):
+    """``VCSC[perm_rows]`` breaks run order on the host; the upload repairs it."""
+    import cupy as cp
+
+    perm = np.random.default_rng(1).permutation(mat.shape[0])
+    arr = VCSCArray.from_scipy(mat)[perm]
+    gpu = arr.normalized("raw").to_gpu()
+    _check_gpu_runs_ascending(gpu)
+    B = np.random.default_rng(2).standard_normal((mat.shape[1], width))
+    Bt = np.random.default_rng(3).standard_normal((width, mat.shape[0]))
+    nv = arr.normalized("raw")
+    assert_close(gpu @ cp.asarray(B, dtype=cp.float32), nv @ B)
+    assert_close(cp.asarray(Bt, dtype=cp.float32) @ gpu, Bt @ nv)
+
+
+def _check_gpu_runs_ascending(gpu) -> None:
+    import cupy as cp
+
+    idx = cp.asnumpy(gpu.indices).astype(np.int64)
+    ptr = cp.asnumpy(gpu.value_ptr)
+    bad = np.flatnonzero(idx[1:] < idx[:-1]) + 1
+    assert np.isin(bad, ptr).all()

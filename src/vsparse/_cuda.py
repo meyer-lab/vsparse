@@ -661,6 +661,30 @@ def _grid(n_items: int) -> tuple[int]:
 # -- the device-resident view -------------------------------------------------
 
 
+def _sorted_within_runs(cp: Any, indices: Any, value_ptr: Any, n_minor: int) -> Any:
+    """``indices`` with every value-run ascending, sorting only if one is not.
+
+    Arrays built the normal way already satisfy this, and the kernels gain
+    nothing from re-sorting them. A few paths break it silently -- notably
+    ``VCSC[perm_rows]`` -- and for a VCSC at width 1 to 2 that costs up to
+    ~3x, since the dense operand is indexed by cell id and ascending ids share
+    cache lines. The check is one pass over ``indices``; the sort (a key sort
+    over ``run_id * n_minor + index``, runs being contiguous) runs only when
+    the check fails.
+    """
+    if len(indices) < 2:
+        return indices
+    ptr = cp.asarray(value_ptr, dtype=cp.int64)
+    descent = indices[1:] < indices[:-1]
+    # Ascent is not required across runs: mask each run's first element.
+    descent[ptr[1:-1] - 1] = False
+    if not bool(descent.any()):
+        return indices
+    run_id = cp.repeat(cp.arange(len(ptr) - 1, dtype=cp.int64), cp.diff(ptr))
+    keys = cp.sort(run_id * n_minor + indices.astype(cp.int64))
+    return (keys % n_minor).astype(indices.dtype)
+
+
 class CudaNormalizedView:
     """A :class:`~vsparse._norm_common.NormalizedViewBase` resident on a CUDA device.
 
@@ -714,7 +738,9 @@ class CudaNormalizedView:
         # (`value_ptr`); both share one dtype (one kernel type), sized for the
         # larger count, nnz: int32 unless that exceeds 2**31 - 1.
         n_minor = self.shape[1] if self._format == "csr" else self.shape[0]
-        self.indices = cp.asarray(arr.indices, dtype=_index_dtype(n_minor))
+        self.indices = _sorted_within_runs(
+            cp, cp.asarray(arr.indices, dtype=_index_dtype(n_minor)), arr.value_ptr, n_minor
+        )
         ptr_dtype = _pointer_dtype(len(arr.indices))
         self.major_ptr = cp.asarray(arr.major_ptr, dtype=ptr_dtype)
         self.value_ptr = cp.asarray(arr.value_ptr, dtype=ptr_dtype)
@@ -891,8 +917,8 @@ class CudaNormalizedView:
             should pay the one-time conversion and pass ``"csr"``.
         sort_indices : bool, default True
             Whether to sort each slice's indices ascending before returning.
-            A VCS slice stores its indices grouped by the value they share,
-            never in index order, so the expanded matrix is *not* canonical
+            A VCS slice stores its indices grouped by the value they share
+            (ascending within each run, but not across runs), so the expanded matrix is *not* canonical
             unless this sorts it -- and cuSPARSE measured ~6x slower on the
             unsorted form. That penalty is why this defaults to ``True``
             where the host's
