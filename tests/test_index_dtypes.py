@@ -8,6 +8,7 @@ from vsparse import VCSCAnnData, VCSCArray, VCSRArray, _ops
 from vsparse._indexutils import smallest_index_dtype
 
 INT32_MAX = np.iinfo(np.int32).max
+UINT16_AXIS_MAX = np.iinfo(np.uint16).max + 1
 
 
 @pytest.fixture(params=[VCSCArray, VCSRArray])
@@ -26,18 +27,45 @@ def _with_int64_indices(mat):
     return out
 
 
-@pytest.mark.parametrize(("n", "expected"), [(INT32_MAX, np.int32), (INT32_MAX + 1, np.int64)])
-def test_dtype_switches_at_the_int32_boundary(n, expected):
+@pytest.mark.parametrize(
+    ("n", "expected"),
+    [
+        (1, np.uint16),
+        (UINT16_AXIS_MAX, np.uint16),
+        (UINT16_AXIS_MAX + 1, np.int32),
+        (INT32_MAX, np.int32),
+        (INT32_MAX + 1, np.int64),
+    ],
+)
+def test_dtype_switches_at_the_uint16_and_int32_boundaries(n, expected):
     assert smallest_index_dtype(n) == np.dtype(expected)
 
 
+@pytest.mark.parametrize(
+    ("n_minor", "expected"), [(UINT16_AXIS_MAX, np.uint16), (UINT16_AXIS_MAX + 1, np.int32)]
+)
+def test_largest_index_survives_the_uint16_boundary(vcls, n_minor, expected):
+    """Position ``n_minor - 1`` is stored and read back intact on either side of 2**16."""
+    last = n_minor - 1
+    mat_cls = sp.csc_array if vcls is VCSCArray else sp.csr_array
+    shape = (n_minor, 2) if vcls is VCSCArray else (2, n_minor)
+    mat = mat_cls(
+        (np.array([3.0, 5.0]), np.array([0, last], dtype=np.int64), np.array([0, 1, 2])),
+        shape=shape,
+    )
+    v = vcls.from_scipy(mat)
+    assert v.indices.dtype == np.dtype(expected)
+    np.testing.assert_array_equal(np.sort(v.indices), [0, last])
+    np.testing.assert_allclose(v.toarray(), mat.toarray())
+
+
 def test_from_scipy_narrows_int64_indices(dense, vcls):
-    """An int64-indexed input is stored as int32 when the minor axis fits."""
+    """An int64-indexed input is stored as uint16 when the minor axis fits."""
     mat = _with_int64_indices(_scipy_for(vcls, dense))
     v = vcls.from_scipy(mat)
 
-    assert v.indices.dtype == np.int32
-    assert v.indices.nbytes == 4 * v.nnz
+    assert v.indices.dtype == np.uint16
+    assert v.indices.nbytes == 2 * v.nnz
     np.testing.assert_allclose(v.toarray(), dense)
 
 
@@ -126,7 +154,7 @@ def test_large_out_of_bounds_index_raises(vcls):
 def test_derived_arrays_stay_narrow(vcls, dense, op):
     """Narrowing lives in __init__, so every op building a new array inherits it."""
     v = vcls.from_scipy(_with_int64_indices(_scipy_for(vcls, dense)))
-    assert op(v, dense).indices.dtype == np.int32
+    assert op(v, dense).indices.dtype == np.uint16
 
 
 def test_roundtrip_preserves_values_and_stores_narrow_indices(tmp_path, dense):
@@ -138,7 +166,7 @@ def test_roundtrip_preserves_values_and_stores_narrow_indices(tmp_path, dense):
 
     back = VCSCAnnData.read_h5ad(path)
     assert isinstance(back.X, VCSRArray)
-    assert back.X.indices.dtype == np.int32
+    assert back.X.indices.dtype == np.uint16
     np.testing.assert_allclose(back.X.toarray(), dense)
 
 
@@ -155,5 +183,5 @@ def test_packed_write_narrows_a_wide_in_memory_array(tmp_path, dense):
 
     back = VCSCAnnData.read_h5ad(path)
     assert isinstance(back.X, VCSRArray)
-    assert back.X.indices.dtype == np.int32
+    assert back.X.indices.dtype == np.uint16
     np.testing.assert_allclose(back.X.toarray(), dense)
