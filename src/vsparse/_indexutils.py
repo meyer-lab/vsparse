@@ -9,10 +9,20 @@ import numpy as np
 __all__ = ["is_full_slice", "normalize_major_idx", "smallest_index_dtype"]
 
 _INT32_MAX = np.iinfo(np.int32).max
+# The largest axis whose positions (0 .. n - 1) all fit in a uint16.
+_UINT16_AXIS_MAX = np.iinfo(np.uint16).max + 1
 
 
 def smallest_index_dtype(n: int) -> np.dtype:
-    """Narrowest signed integer dtype that can address an axis of length ``n``."""
+    """Narrowest integer dtype that can address an axis of length ``n``.
+
+    ``uint16`` for axes up to 65,536 long (every gene axis in the single-cell
+    datasets we target), halving the bytes of ``indices`` against ``int32``;
+    otherwise the signed ``int32``/``int64``, so wider axes keep signed
+    arithmetic on indices safe.
+    """
+    if n <= _UINT16_AXIS_MAX:
+        return np.dtype(np.uint16)
     return np.dtype(np.int32) if n <= _INT32_MAX else np.dtype(np.int64)
 
 
