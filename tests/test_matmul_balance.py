@@ -45,7 +45,8 @@ def test_products_match_dense_on_skewed_counts(vcls, recipe, threads):
     rng = np.random.default_rng(1)
     B, L = rng.normal(size=(dense.shape[1], 5)), rng.normal(size=(4, dense.shape[0]))
     previous = numba.get_num_threads()
-    numba.set_num_threads(threads)
+    # numba refuses more threads than the machine launched with (4 on CI runners).
+    numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
     try:
         np.testing.assert_allclose(nv @ B, ref @ B, atol=1e-9)
         np.testing.assert_allclose(L @ nv, L @ ref, atol=1e-9)
