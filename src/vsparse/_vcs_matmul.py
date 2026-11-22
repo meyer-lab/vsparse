@@ -61,6 +61,43 @@ from vsparse._ops import accumulator_threads
 if TYPE_CHECKING:
     from vsparse._vcs_norm import _VCSNormalizedBase
 
+#: The major-aligned kernels cut the major axis into this many nonzero-balanced chunks per
+#: thread. More than one lets a thread that finishes early take up the remaining work only if
+#: the schedule is dynamic, which Numba's is not; the extra chunks cost nothing, and they keep
+#: each chunk small enough that the rounding of a cut to a slice boundary cannot unbalance it.
+_CHUNKS_PER_THREAD = 4
+
+
+@numba.njit(cache=True)
+def _nnz_balanced_bounds(major_ptr, value_ptr, nchunks):
+    """Cut the major slices into ``nchunks`` contiguous ranges of about equal nonzeros.
+
+    Returns ``bounds`` of length ``nchunks + 1`` with ``bounds[0] == 0`` and
+    ``bounds[-1] == n_major``; chunk ``c`` is slices ``bounds[c]:bounds[c + 1]``
+    (possibly empty). Real count matrices have heavy-tailed slice lengths (28% of
+    Lupus's nonzeros sit in 1% of its genes, and the longest gene is in every cell),
+    and the long slices cluster along the axis, so an equal-count split leaves the
+    thread that owns them with many times the mean work. One serial pass over the
+    ``n_major + 1`` pointers; the cut falls at the first slice end that reaches each
+    target, so no chunk is more than one slice over its share.
+    """
+    n_major = major_ptr.shape[0] - 1
+    bounds = np.empty(nchunks + 1, dtype=np.int64)
+    bounds[0] = 0
+    base = value_ptr[major_ptr[0]]
+    total = value_ptr[major_ptr[n_major]] - base
+    c = 1
+    for j in range(n_major):
+        done = value_ptr[major_ptr[j + 1]] - base
+        while c < nchunks and done * nchunks >= c * total:
+            bounds[c] = j + 1
+            c += 1
+    while c <= nchunks:
+        bounds[c] = n_major
+        c += 1
+    return bounds
+
+
 __all__ = ["dense_at_normalized", "normalized_at_dense"]
 
 
@@ -69,21 +106,42 @@ __all__ = ["dense_at_normalized", "normalized_at_dense"]
 
 @numba.njit(cache=True, parallel=True)
 def _vcsr_matmul_delta(
-    major_ptr, values, value_ptr, indices, row_scale, gene_scale, col_post_scale, g_code, B, out
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    row_scale,
+    gene_scale,
+    col_post_scale,
+    g_code,
+    hoist,
+    bounds,
+    B,
+    out,
 ):
-    n_major = major_ptr.shape[0] - 1
+    """``Delta @ B`` for a VCSR array, parallel over nonzero-balanced chunks of rows.
+
+    ``hoist`` is true when ``gene_scale`` is all ones (the recipe has no per-gene
+    scaling): then ``g(v / rs / gs)`` is the same for every index of a value group, and
+    is evaluated once per group instead of once per stored entry.
+    """
     k = B.shape[1]
-    for i in numba.prange(n_major):  # ty: ignore[not-iterable]
-        rs = row_scale[i]
-        for u in range(major_ptr[i], major_ptr[i + 1]):
-            v = values[u]
-            for kk in range(value_ptr[u], value_ptr[u + 1]):
-                col = indices[kk]
-                gs = gene_scale[col]
-                if gs > 0.0:
-                    delta = col_post_scale[col] * _g(v / rs / gs, g_code)
-                    for c in range(k):
-                        out[i, c] += delta * B[col, c]
+    for t in numba.prange(bounds.shape[0] - 1):  # ty: ignore[not-iterable]
+        for i in range(bounds[t], bounds[t + 1]):
+            rs = row_scale[i]
+            orow = out[i]
+            for u in range(major_ptr[i], major_ptr[i + 1]):
+                v = values[u]
+                gv = _g(v / rs, g_code) if hoist else 0.0
+                for kk in range(value_ptr[u], value_ptr[u + 1]):
+                    col = indices[kk]
+                    gs = gene_scale[col]
+                    if gs > 0.0:
+                        g = gv if hoist else _g(v / rs / gs, g_code)
+                        delta = col_post_scale[col] * g
+                        brow = B[col]
+                        for c in range(k):
+                            orow[c] += delta * brow[c]
 
 
 # -- major-aligned: VCSC, B @ self (out cols == major slices) ---------------
@@ -102,24 +160,39 @@ def _vcsr_matmul_delta(
 
 @numba.njit(cache=True, parallel=True)
 def _vcsc_rmatmul_delta(
-    major_ptr, values, value_ptr, indices, row_scale, gene_scale, col_post_scale, g_code, Bt, out_t
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    row_scale,
+    gene_scale,
+    col_post_scale,
+    g_code,
+    bounds,
+    Bt,
+    out_t,
 ):
-    n_major = major_ptr.shape[0] - 1
+    """``B @ Delta`` for a VCSC array, parallel over nonzero-balanced chunks of columns.
+
+    ``g`` cannot be hoisted out of the group here: the argument ``v / row_scale[row]``
+    changes with the row of every index.
+    """
     p = Bt.shape[1]
-    for j in numba.prange(n_major):  # ty: ignore[not-iterable]
-        gs = gene_scale[j]
-        if gs == 0.0:
-            continue
-        s = col_post_scale[j]
-        acc = out_t[j]
-        for u in range(major_ptr[j], major_ptr[j + 1]):
-            v = values[u]
-            for kk in range(value_ptr[u], value_ptr[u + 1]):
-                row = indices[kk]
-                delta = s * _g(v / row_scale[row] / gs, g_code)
-                brow = Bt[row]
-                for c in range(p):
-                    acc[c] += delta * brow[c]
+    for t in numba.prange(bounds.shape[0] - 1):  # ty: ignore[not-iterable]
+        for j in range(bounds[t], bounds[t + 1]):
+            gs = gene_scale[j]
+            if gs == 0.0:
+                continue
+            s = col_post_scale[j]
+            acc = out_t[j]
+            for u in range(major_ptr[j], major_ptr[j + 1]):
+                v = values[u]
+                for kk in range(value_ptr[u], value_ptr[u + 1]):
+                    row = indices[kk]
+                    delta = s * _g(v / row_scale[row] / gs, g_code)
+                    brow = Bt[row]
+                    for c in range(p):
+                        acc[c] += delta * brow[c]
 
 
 # -- misaligned direction: per-thread private accumulators, no regrouping ----
@@ -135,25 +208,23 @@ def _vcsc_matmul_delta_minor(
     gene_scale,
     col_post_scale,
     g_code,
+    bounds,
     B,
-    nthreads,
     n_rows,
 ):
     """``Delta @ B`` for a VCSC array (major=columns), walked directly (no VCSR regroup).
 
     ``B`` is ``(n_cols, k)``; returns ``(n_rows, k)``. Parallel-safe because
     each thread scatters into its own private ``(n_rows, k)`` accumulator
-    while owning a disjoint, contiguous range of columns.
+    while owning a disjoint, contiguous range of columns; ``bounds`` has one
+    range per thread, balanced by nonzeros.
     """
-    n_major = major_ptr.shape[0] - 1  # n_cols
+    nthreads = bounds.shape[0] - 1
     k = B.shape[1]
-    chunk = (n_major + nthreads - 1) // nthreads
     partial = np.zeros((nthreads, n_rows, k), dtype=np.float64)
     for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
-        start = t * chunk
-        stop = min(n_major, start + chunk)
         local = partial[t]
-        for j in range(start, stop):
+        for j in range(bounds[t], bounds[t + 1]):
             gs = gene_scale[j]
             if gs == 0.0:
                 continue
@@ -180,8 +251,9 @@ def _vcsr_rmatmul_delta_minor(
     gene_scale,
     col_post_scale,
     g_code,
+    hoist,
+    bounds,
     Bt,
-    nthreads,
     n_cols,
 ):
     """``B @ Delta`` for a VCSR array (major=rows), walked directly (no VCSC regroup).
@@ -189,26 +261,26 @@ def _vcsr_rmatmul_delta_minor(
     ``Bt`` is ``(n_rows, p)`` (``B`` transposed); returns ``(n_cols, p)``.
     Parallel-safe because each thread scatters into its own private
     ``(n_cols, p)`` accumulator while owning a disjoint, contiguous range of
-    rows.
+    rows; ``bounds`` has one range per thread, balanced by nonzeros. ``hoist``
+    is as for :func:`_vcsr_matmul_delta`.
     """
-    n_major = major_ptr.shape[0] - 1  # n_rows
+    nthreads = bounds.shape[0] - 1
     p = Bt.shape[1]
-    chunk = (n_major + nthreads - 1) // nthreads
     partial = np.zeros((nthreads, n_cols, p), dtype=np.float64)
     for t in numba.prange(nthreads):  # ty: ignore[not-iterable]
-        start = t * chunk
-        stop = min(n_major, start + chunk)
         local = partial[t]
-        for i in range(start, stop):
+        for i in range(bounds[t], bounds[t + 1]):
             rs = row_scale[i]
             brow = Bt[i]
             for u in range(major_ptr[i], major_ptr[i + 1]):
                 v = values[u]
+                gv = _g(v / rs, g_code) if hoist else 0.0
                 for kk in range(value_ptr[u], value_ptr[u + 1]):
                     col = indices[kk]
                     gs = gene_scale[col]
                     if gs > 0.0:
-                        delta = col_post_scale[col] * _g(v / rs / gs, g_code)
+                        g = gv if hoist else _g(v / rs / gs, g_code)
+                        delta = col_post_scale[col] * g
                         acc = local[col]
                         for c in range(p):
                             acc[c] += delta * brow[c]
@@ -226,6 +298,11 @@ def _prep_dense(other: Any, expect_rows: int) -> tuple[np.ndarray, bool]:
     if B.ndim != 2 or B.shape[0] != expect_rows:
         raise ValueError(f"shape mismatch: expected first dimension {expect_rows}, got {B.shape}")
     return np.ascontiguousarray(B), squeeze
+
+
+def _bounds(arr: Any, nchunks: int) -> np.ndarray:
+    """Nonzero-balanced chunk bounds over the major slices of ``arr`` (see :func:`_nnz_balanced_bounds`)."""
+    return _nnz_balanced_bounds(arr.major_ptr, arr.value_ptr, nchunks)
 
 
 def normalized_at_dense(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
@@ -248,6 +325,8 @@ def normalized_at_dense(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             nview.gene_scale,
             nview.col_post_scale,
             g_code,
+            not nview.recipe.gene_scale,
+            _bounds(arr, _CHUNKS_PER_THREAD * numba.get_num_threads()),
             B,
             out,
         )
@@ -263,8 +342,8 @@ def normalized_at_dense(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             nview.gene_scale,
             nview.col_post_scale,
             g_code,
+            _bounds(arr, nthreads),
             B,
-            nthreads,
             arr.shape[0],
         )
 
@@ -301,6 +380,7 @@ def dense_at_normalized(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             nview.gene_scale,
             nview.col_post_scale,
             g_code,
+            _bounds(arr, _CHUNKS_PER_THREAD * numba.get_num_threads()),
             Bt,
             out_t,
         )
@@ -316,8 +396,9 @@ def dense_at_normalized(nview: _VCSNormalizedBase, other: Any) -> np.ndarray:
             nview.gene_scale,
             nview.col_post_scale,
             g_code,
+            not nview.recipe.gene_scale,
+            _bounds(arr, nthreads),
             Bt,
-            nthreads,
             arr.shape[1],
         )
 
