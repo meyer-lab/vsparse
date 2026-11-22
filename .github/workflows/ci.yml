@@ -109,7 +109,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
-          enable-cache: true
+          # Self-hosted: keep uv's cache on the runner's own disk (the default
+          # ~/.cache/uv) instead of round-tripping GBs of CUDA wheels through
+          # GitHub's cache service on every run.
+          enable-cache: false
           python-version: "3.12"
 
       # Informational, and deliberately non-fatal: on a runner with no GPU at
