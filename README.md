@@ -85,6 +85,12 @@ y_left = x @ v  # Vector-matrix: (n_rows,) @ (n_rows, n_cols) -> (n_cols,)
 Y = v @ B  # Matrix-matrix: (n_rows, n_cols) @ (n_cols, k) -> (n_rows, k)
 Y_left = B @ v  # Matrix-matrix: (k, n_rows) @ (n_rows, n_cols) -> (k, n_cols)
 
+# Reductions, whole-matrix and per group of rows/columns
+col_totals = v.sum(axis=0)  # also mean/max/min/getnnz
+cond_sums = v.group_sum(condition_idxs, n_cond)  # (n_cond, n_cols) per-condition sums
+cond_depth = v.group_sum(condition_idxs, n_cond, total=True)  # (n_cond,) totals
+cond_means = v.group_mean(condition_idxs, n_cond)  # also group_nnz
+
 # Slicing
 col_slice = v[:, [1, 3, 5]]  # Fast major-axis slicing (returns VCSCArray)
 sub = v[0:10, 0:10]  # 2D slicing (falls back to scipy)

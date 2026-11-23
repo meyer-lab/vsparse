@@ -56,6 +56,49 @@ Attach a decompressed result back onto an `AnnData` object as a layer:
 vsparse.to_layer(adata, v, key="vcsc_roundtrip")
 ```
 
+### Reductions
+
+`sum`, `mean`, `max`, `min` and `getnnz` take `axis=None|0|1` like their numpy/scipy
+counterparts. Summing along the major axis (columns for `VCSCArray`, rows for
+`VCSRArray`) reads only the deduplicated values, never `indices`.
+
+### Grouped (per-condition) reductions
+
+Multi-sample methods (e.g. PARAFAC2 over `condition_unique_idxs`) need reductions per
+sample or condition rather than over the whole matrix. `group_sum`, `group_nnz` and
+`group_mean` collapse one axis into `n_groups` bins given a group label for each row
+(`axis=0`, the default) or column (`axis=1`):
+
+```python
+import numpy as np
+
+# condition_idxs[i] in [0, n_cond) is the condition of row (cell) i
+cond_sums = v.group_sum(condition_idxs, n_cond)  # (n_cond, n_cols)
+cond_nnz = v.group_nnz(condition_idxs, n_cond)  # (n_cond, n_cols), int64
+cond_means = v.group_mean(condition_idxs, n_cond)  # (n_cond, n_cols), implicit zeros included
+
+# total=True also reduces the other axis: one number per group
+cond_depth = v.group_sum(condition_idxs, n_cond, total=True)  # (n_cond,)
+cells_per_cond = np.bincount(condition_idxs, minlength=n_cond)
+
+# Grouping columns instead, e.g. gene sets: (n_rows, n_sets)
+set_scores = v.group_sum(gene_set_idxs, n_sets, axis=1)
+```
+
+They generalize the whole-matrix reductions: with every label `0` and `n_groups=1`,
+`v.group_sum(labels, 1, axis=0)[0]` equals `v.sum(axis=0)`. Labels need not be sorted
+or contiguous, and empty groups are allowed (their sums and counts are `0` and their
+means `nan`). Sums and means are returned as `float64`, counts as `int64`. Like `getnnz`,
+`group_nnz` counts explicitly stored zeros.
+
+Grouping along the major axis with `total=True` (e.g. per-condition depth for a
+`VCSRArray` grouped by row) never reads `indices`, so it costs about as much as
+`v.sum(axis=1)`. Otherwise each reduction is a single parallel pass over the stored
+values, with no scratch memory proportional to the number of threads, except when there
+are fewer groups than threads. In that case each thread keeps its own
+`(n_groups, n_minor)` buffer, within the same memory budget as the other minor-axis
+reductions.
+
 ## `VCSCAnnData`: X backed directly by a VCSCArray
 
 `vsparse.VCSCAnnData` is an `AnnData` subclass whose `X` (and, separately, `raw_X`) *is* a
