@@ -335,6 +335,101 @@ class _VCSBase:
         denom = self.shape[0] if axis == 0 else self.shape[1]
         return self.sum(axis=axis) / denom if denom else np.full(0, float("nan"))
 
+    # -- grouped (per-condition) reductions ---------------------------------
+
+    def group_sum(
+        self, group_idxs: Any, n_groups: int, axis: int = 0, *, total: bool = False
+    ) -> np.ndarray:
+        """Sum of values within each group of rows (``axis=0``) or columns (``axis=1``).
+
+        The grouped counterpart of :meth:`sum`: where ``sum(axis=0)``
+        collapses every row into one, ``group_sum(group_idxs, n_groups,
+        axis=0)`` collapses the rows into ``n_groups`` bins, one per label --
+        e.g. per-condition (per-sample) gene totals given each cell's
+        condition. See :mod:`vsparse._grouped` for the kernels.
+
+        Grouping along the major axis (rows for :class:`VCSRArray`, columns
+        for :class:`VCSCArray`) with ``total=True`` never reads ``indices``,
+        like :meth:`sum`'s major-axis path, so per-condition depth is nearly
+        free.
+
+        Parameters
+        ----------
+        group_idxs : array-like of int
+            Group label, in ``[0, n_groups)``, of each row (``axis=0``,
+            length ``shape[0]``) or column (``axis=1``, length ``shape[1]``).
+            Labels need not be sorted or contiguous, and groups may be empty.
+        n_groups : int
+            The total number of groups.
+        axis : {0, 1}, default 0
+            The axis that ``group_idxs`` labels and that is collapsed into
+            groups.
+        total : bool, default False
+            If ``True``, also sum over the other axis, giving each group's
+            grand total.
+
+        Returns
+        -------
+        np.ndarray
+            ``float64``. With ``total=False``, shape ``(n_groups, shape[1])``
+            for ``axis=0`` or ``(shape[0], n_groups)`` for ``axis=1``; with
+            ``total=True``, shape ``(n_groups,)``.
+
+        Examples
+        --------
+        >>> import numpy as np, scipy.sparse as sp
+        >>> from vsparse import VCSRArray
+        >>> x = VCSRArray.from_scipy(sp.csr_array(np.array([[1, 0], [2, 3], [0, 4]])))
+        >>> x.group_sum([0, 1, 0], 2)  # rows 0 and 2 form group 0
+        array([[1., 4.],
+               [2., 3.]])
+        >>> x.group_sum([0, 1, 0], 2, total=True)
+        array([5., 5.])
+        """
+        from vsparse import _grouped
+
+        groups, n_groups, axis = _grouped.validate_groups(self, group_idxs, n_groups, axis)
+        return _grouped.group_reduce(self, groups, n_groups, axis, total=total, count=False)
+
+    def group_nnz(
+        self, group_idxs: Any, n_groups: int, axis: int = 0, *, total: bool = False
+    ) -> np.ndarray:
+        """Count of stored elements within each group of rows (``axis=0``) or columns (``axis=1``).
+
+        The grouped counterpart of :meth:`getnnz` -- e.g. per-condition
+        n-cells-by-counts for each gene. Takes the same arguments as
+        :meth:`group_sum` and returns the same shapes, as ``int64``. Like
+        :meth:`getnnz`, explicitly stored zeros are counted.
+        """
+        from vsparse import _grouped
+
+        groups, n_groups, axis = _grouped.validate_groups(self, group_idxs, n_groups, axis)
+        out = _grouped.group_reduce(self, groups, n_groups, axis, total=total, count=True)
+        return out.astype(np.int64)
+
+    def group_mean(
+        self, group_idxs: Any, n_groups: int, axis: int = 0, *, total: bool = False
+    ) -> np.ndarray:
+        """Mean (including implicit zeros) within each group of rows (``axis=0``) or columns (``axis=1``).
+
+        The grouped counterpart of :meth:`mean`: :meth:`group_sum` divided by
+        the number of rows (or columns) in each group, and with
+        ``total=True`` also by the length of the other axis. Takes the same
+        arguments as :meth:`group_sum` and returns the same shapes. An empty
+        group's mean is ``nan``.
+        """
+        from vsparse import _grouped
+
+        groups, n_groups, axis = _grouped.validate_groups(self, group_idxs, n_groups, axis)
+        sums = _grouped.group_reduce(self, groups, n_groups, axis, total=total, count=False)
+        denom = _grouped.group_counts(groups, n_groups).astype(np.float64)
+        if total:
+            denom *= self.shape[1 - axis]
+        elif axis == 0:
+            denom = denom[:, None]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return sums / denom
+
     def _reduce_initial(self, kind: str) -> Any:
         """Identity element for a max/min reduction over ``self.values.dtype``."""
         dt = self.values.dtype
