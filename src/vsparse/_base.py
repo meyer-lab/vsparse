@@ -83,6 +83,26 @@ class _VCSBase:
         self._norm_cache = _NormCache()
         self._stats: _stats.VCSStats | None = None
 
+    @classmethod
+    def _from_validated(
+        cls,
+        shape: tuple[int, int],
+        major_ptr: np.ndarray,
+        values: np.ndarray,
+        value_ptr: np.ndarray,
+        indices: np.ndarray,
+    ) -> _VCSBase:
+        """Build without re-scanning ``indices`` for bounds (for internal ops on validated arrays)."""
+        self = object.__new__(cls)
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.major_ptr = major_ptr
+        self.values = values
+        self.value_ptr = value_ptr
+        self.indices = indices
+        self._norm_cache = _NormCache()
+        self._stats = None
+        return self
+
     # -- axis bookkeeping ------------------------------------------------
 
     @classmethod
@@ -630,37 +650,162 @@ class _VCSBase:
             return self._dot_left_mat(other_arr)
         return NotImplemented
 
-    # -- indexing -------------------------------------------------------------
+    # -- zero-copy block slicing (#77) ----------------------------------------
+
+    def major_slice(self, start: int, end: int) -> _VCSBase:
+        """Zero-copy view of contiguous major-axis slices ``[start, end)``.
+
+        Shares ``values`` and ``indices`` buffers with ``self`` (no copy),
+        rebasing only the slice's ``major_ptr`` and ``value_ptr`` offsets.
+        """
+        n_major = self.n_major
+        s = int(start)
+        e = int(end)
+        if s < 0:
+            s += n_major
+        if e < 0:
+            e += n_major
+        if not (0 <= s <= e <= n_major):
+            raise IndexError(f"major_slice bounds ({start}, {end}) out of range for {n_major}")
+
+        g0 = int(self.major_ptr[s])
+        g1 = int(self.major_ptr[e])
+        k0 = int(self.value_ptr[g0])
+        k1 = int(self.value_ptr[g1])
+
+        new_major_ptr = self.major_ptr[s : e + 1] - g0
+        new_values = self.values[g0:g1]
+        new_value_ptr = self.value_ptr[g0 : g1 + 1] - k0
+        new_indices = self.indices[k0:k1]
+        new_shape = (self.n_minor, e - s) if self._format == "csc" else (e - s, self.n_minor)
+        return type(self)._from_validated(
+            new_shape, new_major_ptr, new_values, new_value_ptr, new_indices
+        )
+
+    def nnz_blocks(self, max_nnz: int) -> list[tuple[int, int]]:
+        """Partition the major axis into ``(start, end)`` ranges of at most ``max_nnz`` nonzeros.
+
+        If a single major slice exceeds ``max_nnz`` nonzeros, it is placed in
+        its own single-slice block ``(i, i + 1)``.
+        """
+        if max_nnz <= 0:
+            raise ValueError(f"max_nnz must be positive, got {max_nnz}")
+        n_major = self.n_major
+        if n_major == 0:
+            return []
+        slice_nnz = self.value_ptr[self.major_ptr]
+        blocks: list[tuple[int, int]] = []
+        pos = 0
+        while pos < n_major:
+            target = int(slice_nnz[pos]) + max_nnz
+            nxt = int(np.searchsorted(slice_nnz, target, side="right") - 1)
+            if nxt <= pos:
+                nxt = pos + 1
+            blocks.append((pos, nxt))
+            pos = nxt
+        return blocks
+
+    # -- indexing (#78) -------------------------------------------------------
 
     def _select_major(self, key: Any) -> _VCSBase:
-        idx = _normalize_major_idx(key, self.n_major)
+        idx = np.ascontiguousarray(_normalize_major_idx(key, self.n_major), dtype=np.int64)
         starts = self.major_ptr[idx]
         ends = self.major_ptr[idx + 1]
         counts = ends - starts
         new_major_ptr = np.zeros(idx.shape[0] + 1, dtype=np.int64)
         np.cumsum(counts, out=new_major_ptr[1:])
 
-        value_slots = (
-            np.concatenate([np.arange(s, e) for s, e in zip(starts, ends, strict=True)])
-            if idx.shape[0]
-            else np.empty(0, dtype=np.int64)
-        )
-        new_values = self.values[value_slots]
+        slice_nnz = self.value_ptr[ends] - self.value_ptr[starts]
+        slice_idx_offsets = np.zeros(idx.shape[0] + 1, dtype=np.int64)
+        np.cumsum(slice_nnz, out=slice_idx_offsets[1:])
 
-        v_starts = self.value_ptr[value_slots]
-        v_ends = self.value_ptr[value_slots + 1]
-        idx_counts = v_ends - v_starts
-        new_value_ptr = np.zeros(value_slots.shape[0] + 1, dtype=np.int64)
-        np.cumsum(idx_counts, out=new_value_ptr[1:])
-        new_indices = (
-            np.concatenate([self.indices[s:e] for s, e in zip(v_starts, v_ends, strict=True)])
-            if value_slots.shape[0]
-            else np.empty(0, dtype=self.indices.dtype)
+        n_slots = int(new_major_ptr[-1])
+        total_nnz = int(slice_idx_offsets[-1])
+        new_values = np.empty(n_slots, dtype=self.values.dtype)
+        new_value_ptr = np.empty(n_slots + 1, dtype=np.int64)
+        new_indices = np.empty(total_nnz, dtype=self.indices.dtype)
+
+        _ops.major_select_fill(
+            self.major_ptr,
+            self.values,
+            self.value_ptr,
+            self.indices,
+            idx,
+            new_major_ptr,
+            slice_idx_offsets,
+            new_values,
+            new_value_ptr,
+            new_indices,
+        )
+        new_shape = (
+            (self.n_minor, idx.shape[0]) if self._format == "csc" else (idx.shape[0], self.n_minor)
+        )
+        return type(self)._from_validated(
+            new_shape, new_major_ptr, new_values, new_value_ptr, new_indices
         )
 
-        n_minor = self.n_minor
-        new_shape = (n_minor, idx.shape[0]) if self._format == "csc" else (idx.shape[0], n_minor)
-        return type(self)(new_shape, new_major_ptr, new_values, new_value_ptr, new_indices)
+    def _select_both(self, major_key: Any, minor_key: Any) -> _VCSBase:
+        """Combined major + minor selection in one pass without materializing the intermediate."""
+        maj_idx = np.ascontiguousarray(
+            _normalize_major_idx(major_key, self.n_major), dtype=np.int64
+        )
+        min_idx = np.ascontiguousarray(
+            _normalize_major_idx(minor_key, self.n_minor), dtype=np.int64
+        )
+        n_minor_new = min_idx.shape[0]
+
+        slot_offsets = np.zeros(maj_idx.shape[0] + 1, dtype=np.int64)
+        np.cumsum(self.major_ptr[maj_idx + 1] - self.major_ptr[maj_idx], out=slot_offsets[1:])
+
+        fanout = np.bincount(min_idx, minlength=self.n_minor)
+        offsets = np.zeros(self.n_minor + 1, dtype=np.int64)
+        np.cumsum(fanout, out=offsets[1:])
+        positions = np.argsort(min_idx, kind="stable").astype(np.int64, copy=False)
+
+        slot_ids, slot_counts = _ops.combined_select_counts(
+            self.major_ptr, self.value_ptr, self.indices, maj_idx, slot_offsets, fanout
+        )
+        nonempty = slot_counts > 0
+        kept_slots = slot_ids[nonempty]
+        new_values = self.values[kept_slots]
+
+        new_value_ptr = np.zeros(kept_slots.shape[0] + 1, dtype=np.int64)
+        np.cumsum(slot_counts[nonempty], out=new_value_ptr[1:])
+        new_indices = np.empty(int(new_value_ptr[-1]), dtype=self.indices.dtype)
+        _ops.combined_select_fill(
+            self.value_ptr,
+            self.indices,
+            offsets,
+            positions,
+            kept_slots,
+            new_value_ptr,
+            new_indices,
+        )
+
+        nonempty_before = np.zeros(slot_counts.shape[0] + 1, dtype=np.int64)
+        np.cumsum(nonempty, out=nonempty_before[1:])
+        new_major_ptr = nonempty_before[slot_offsets]
+        new_shape = (
+            (n_minor_new, maj_idx.shape[0])
+            if self._format == "csc"
+            else (maj_idx.shape[0], n_minor_new)
+        )
+        return type(self)._from_validated(
+            new_shape, new_major_ptr, new_values, new_value_ptr, new_indices
+        )
+
+    def select(self, rows: Any = slice(None), cols: Any = slice(None)) -> _VCSBase:
+        """Select ``rows`` and ``cols`` (single-pass when both axes are subset)."""
+        major_key, minor_key = (cols, rows) if self._format == "csc" else (rows, cols)
+        full_major = _is_full_slice(major_key)
+        full_minor = _is_full_slice(minor_key)
+        if full_major and full_minor:
+            return self.copy()
+        if full_minor:
+            return self._select_major(major_key)
+        if full_major:
+            return self._select_minor(minor_key)
+        return self._select_both(major_key, minor_key)
 
     def _select_minor(self, key: Any) -> _VCSBase:
         """Select along the minor axis (rows for VCSC, columns for VCSR).
@@ -707,7 +852,9 @@ class _VCSBase:
         new_shape = (
             (n_minor_new, self.n_major) if self._format == "csc" else (self.n_major, n_minor_new)
         )
-        return type(self)(new_shape, new_major_ptr, new_values, new_value_ptr, new_indices)
+        return type(self)._from_validated(
+            new_shape, new_major_ptr, new_values, new_value_ptr, new_indices
+        )
 
     def __getitem__(self, key):
         if isinstance(key, tuple):
@@ -722,16 +869,7 @@ class _VCSBase:
         if isinstance(row_key, int | np.integer) and isinstance(col_key, int | np.integer):
             return self.to_scipy()[row_key, col_key]
 
-        major_key, minor_key = (col_key, row_key) if self._format == "csc" else (row_key, col_key)
-        if _is_full_slice(major_key) and _is_full_slice(minor_key):
-            return self.copy()
-
-        result = self
-        if not _is_full_slice(major_key):
-            result = result._select_major(major_key)
-        if not _is_full_slice(minor_key):
-            result = result._select_minor(minor_key)
-        return result
+        return self.select(row_key, col_key)
 
 
 class VCSCArray(_VCSBase):

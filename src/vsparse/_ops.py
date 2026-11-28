@@ -9,9 +9,12 @@ import numpy as np
 
 __all__ = [
     "accumulator_threads",
+    "combined_select_counts",
+    "combined_select_fill",
     "indices_in_bounds",
     "major_matmat",
     "major_matvec",
+    "major_select_fill",
     "minor_counts",
     "minor_extrema",
     "minor_matmat",
@@ -373,6 +376,105 @@ def minor_select_fill(
     value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
 ):
     """Write the remapped minor indices for the surviving slots, in place."""
+    _minor_select_fill(
+        value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
+    )
+
+
+# -- major-axis and combined selection (#78) ---------------------------------
+
+
+@numba.njit(cache=True, parallel=True)
+def _major_select_fill(
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    idx,
+    new_major_ptr,
+    slice_idx_offsets,
+    new_values,
+    new_value_ptr,
+    new_indices,
+):
+    """Parallel range copy of selected major slices ``idx`` into preallocated buffers."""
+    for i in numba.prange(idx.shape[0]):  # ty: ignore[not-iterable]
+        src_m = idx[i]
+        g0 = major_ptr[src_m]
+        g1 = major_ptr[src_m + 1]
+        if g0 == g1:
+            continue
+        out_g = new_major_ptr[i]
+        k0 = value_ptr[g0]
+        k1 = value_ptr[g1]
+        out_k = slice_idx_offsets[i]
+        for g in range(g0, g1):
+            new_values[out_g + (g - g0)] = values[g]
+            new_value_ptr[out_g + (g - g0)] = out_k + (value_ptr[g] - k0)
+        for k in range(k0, k1):
+            new_indices[out_k + (k - k0)] = indices[k]
+
+
+def major_select_fill(
+    major_ptr,
+    values,
+    value_ptr,
+    indices,
+    idx,
+    new_major_ptr,
+    slice_idx_offsets,
+    new_values,
+    new_value_ptr,
+    new_indices,
+):
+    """Fill ``new_values``, ``new_value_ptr``, and ``new_indices`` for major selection ``idx``."""
+    _major_select_fill(
+        major_ptr,
+        values,
+        value_ptr,
+        indices,
+        idx,
+        new_major_ptr,
+        slice_idx_offsets,
+        new_values,
+        new_value_ptr,
+        new_indices,
+    )
+    new_value_ptr[-1] = slice_idx_offsets[-1]
+
+
+@numba.njit(cache=True, parallel=True)
+def _combined_select_counts(
+    major_ptr, value_ptr, indices, idx, slot_offsets, fanout, out_slot_ids, out_counts
+):
+    """For each selected major slice's slots, record source slot id and kept minor count."""
+    for i in numba.prange(idx.shape[0]):  # ty: ignore[not-iterable]
+        src_m = idx[i]
+        out_s = slot_offsets[i]
+        for u in range(major_ptr[src_m], major_ptr[src_m + 1]):
+            out_slot_ids[out_s] = u
+            c = np.int64(0)
+            for k in range(value_ptr[u], value_ptr[u + 1]):
+                c += fanout[indices[k]]
+            out_counts[out_s] = c
+            out_s += 1
+
+
+def combined_select_counts(major_ptr, value_ptr, indices, idx, slot_offsets, fanout):
+    """Source slot ids and kept element counts across selected major slices ``idx``."""
+    n_slots = int(slot_offsets[-1])
+    slot_ids = np.empty(n_slots, dtype=np.int64)
+    counts = np.empty(n_slots, dtype=np.int64)
+    _combined_select_counts(
+        major_ptr, value_ptr, indices, idx, slot_offsets, fanout, slot_ids, counts
+    )
+    return slot_ids, counts
+
+
+def combined_select_fill(
+    value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
+):
+    """Write remapped minor indices for ``kept_slots`` (reuses :func:`minor_select_fill`)."""
     _minor_select_fill(
         value_ptr, indices, offsets, positions, kept_slots, new_value_ptr, out_indices
     )
