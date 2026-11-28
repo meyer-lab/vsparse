@@ -29,7 +29,7 @@ import h5py
 import numpy as np
 import zarr
 
-from vsparse import _ivcsc, _stats
+from vsparse import _compression, _huffman, _ivcsc, _stats
 from vsparse._base import VCSCArray, VCSRArray, _VCSBase
 from vsparse._compression import read_array
 from vsparse._indexutils import smallest_index_dtype
@@ -45,8 +45,18 @@ __all__ = ["read_vcs_subset", "write_ivcs_elem"]
 
 _ARRAY_KEYS = ("major_ptr", "values", "value_ptr", "indices")
 _SPEC_VERSION = "0.1.0"
-_IVCS_SPEC_VERSION = "0.1.0"
+_IVCS_SPEC_VERSION_V1 = "0.1.0"
+_IVCS_SPEC_VERSION = "0.2.0"
 _IVCS_SPEC_NAMES: dict[type[_VCSBase], str] = {VCSCArray: "ivcsc", VCSRArray: "ivcsr"}
+
+
+def _raw_dataset_kwargs(group: GroupStorageType) -> dict[str, Any]:
+    """Dataset kwargs that store an array uncompressed (and contiguous for HDF5)."""
+    if isinstance(group, h5py.Group):
+        return {}
+    if _compression._is_zarr_v2():
+        return {"compressor": None}
+    return {"compressors": ()}
 
 
 def _write_vcs(
@@ -124,14 +134,17 @@ def write_ivcs_elem(
     g.attrs["indices_dtype"] = stored_dtype.name
     for name in ("major_ptr", "values", "value_ptr"):
         ad.io.write_elem(g, name, getattr(v, name), dataset_kwargs=dataset_kwargs)
-    packed = _ivcsc.pack_indices(v.value_ptr, v.indices)
-    ad.io.write_elem(g, "packed_indices", packed, dataset_kwargs=dataset_kwargs)
+    packed, code_lengths, bit_offsets = _huffman.pack_indices(v.major_ptr, v.value_ptr, v.indices)
+    raw_kwargs = _raw_dataset_kwargs(g)
+    ad.io.write_elem(g, "packed_indices", packed, dataset_kwargs=raw_kwargs)
+    ad.io.write_elem(g, "huffman_lengths", code_lengths, dataset_kwargs=raw_kwargs)
+    ad.io.write_elem(g, "bit_offsets", bit_offsets, dataset_kwargs=dataset_kwargs)
     _stats.write_stats(g, v.stats, write_elem=ad.io.write_elem, dataset_kwargs=dataset_kwargs)
     g.attrs["encoding-type"] = "ivcsc" if v._format == "csc" else "ivcsr"
     g.attrs["encoding-version"] = _IVCS_SPEC_VERSION
 
 
-def _make_read_ivcs(cls: type[_VCSBase]):
+def _make_read_ivcs_v1(cls: type[_VCSBase]):
     def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
         major_ptr = read_array(elem["major_ptr"])
         values = read_array(elem["values"])
@@ -139,6 +152,24 @@ def _make_read_ivcs(cls: type[_VCSBase]):
         packed = read_array(elem["packed_indices"])
         dtype = np.dtype(cast(str, elem.attrs["indices_dtype"]))
         indices = _ivcsc.unpack_indices(value_ptr, packed, dtype)
+        arr = cls(_read_shape(elem), major_ptr, values, value_ptr, indices)
+        return _with_stats(arr, elem)
+
+    return _read
+
+
+def _make_read_ivcs_v2(cls: type[_VCSBase]):
+    def _read(elem: GroupStorageType, *, _reader: Reader) -> _VCSBase:
+        major_ptr = read_array(elem["major_ptr"])
+        values = read_array(elem["values"])
+        value_ptr = read_array(elem["value_ptr"])
+        packed = read_array(elem["packed_indices"])
+        code_lengths = read_array(elem["huffman_lengths"])
+        bit_offsets = read_array(elem["bit_offsets"])
+        dtype = np.dtype(cast(str, elem.attrs["indices_dtype"]))
+        indices = _huffman.unpack_indices(
+            major_ptr, value_ptr, packed, code_lengths, bit_offsets, dtype
+        )
         arr = cls(_read_shape(elem), major_ptr, values, value_ptr, indices)
         return _with_stats(arr, elem)
 
@@ -207,14 +238,33 @@ def _read_ivcs_subset(
     remap, minor_inverse, n_minor_new = _minor_remap(minor_key, n_minor)
 
     values = read_array(elem["values"])
-    major_ptr, groups, value_ptr, indices = _ivcsc.unpack_selected(
-        read_array(elem["major_ptr"]),
-        read_array(elem["value_ptr"]),
-        read_array(elem["packed_indices"]),
-        sel,
-        remap,
-        n_minor_new,
-    )
+    major_ptr_raw = read_array(elem["major_ptr"])
+    value_ptr_raw = read_array(elem["value_ptr"])
+    if "huffman_lengths" in elem:
+        code_lengths = read_array(elem["huffman_lengths"])
+        bit_offsets = read_array(elem["bit_offsets"])
+        local_buf, local_bit_offsets = _huffman.read_selected_bytes(
+            elem["packed_indices"], bit_offsets, sel
+        )
+        major_ptr, groups, value_ptr, indices = _huffman.unpack_selected(
+            major_ptr_raw,
+            value_ptr_raw,
+            local_buf,
+            local_bit_offsets,
+            code_lengths,
+            sel,
+            remap,
+            n_minor_new,
+        )
+    else:
+        major_ptr, groups, value_ptr, indices = _ivcsc.unpack_selected(
+            major_ptr_raw,
+            value_ptr_raw,
+            read_array(elem["packed_indices"]),
+            sel,
+            remap,
+            n_minor_new,
+        )
     n_rows, n_cols = cls._swap((sel.shape[0], n_minor_new))
     arr = cls((n_rows, n_cols), major_ptr, values[groups], value_ptr, indices)
     if major_inverse is not None:
@@ -235,9 +285,12 @@ def _register() -> None:
             if not _REGISTRY.has_read(store_type, spec, frozenset()):
                 _REGISTRY.register_read(store_type, spec, frozenset())(_make_read_vcs(cls))
         for cls, spec_name in _IVCS_SPEC_NAMES.items():
-            spec = IOSpec(spec_name, _IVCS_SPEC_VERSION)
-            if not _REGISTRY.has_read(store_type, spec, frozenset()):
-                _REGISTRY.register_read(store_type, spec, frozenset())(_make_read_ivcs(cls))
+            spec_v1 = IOSpec(spec_name, _IVCS_SPEC_VERSION_V1)
+            if not _REGISTRY.has_read(store_type, spec_v1, frozenset()):
+                _REGISTRY.register_read(store_type, spec_v1, frozenset())(_make_read_ivcs_v1(cls))
+            spec_v2 = IOSpec(spec_name, _IVCS_SPEC_VERSION)
+            if not _REGISTRY.has_read(store_type, spec_v2, frozenset()):
+                _REGISTRY.register_read(store_type, spec_v2, frozenset())(_make_read_ivcs_v2(cls))
 
 
 _register()
