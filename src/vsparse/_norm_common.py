@@ -1063,7 +1063,47 @@ class NormalizedViewBase:
         sq = total_sq - 2.0 * total_cross + counts * offset_sq_sum
         return np.sqrt(np.clip(sq, 0.0, None))
 
-    # -- selection ---------------------------------------------------------------
+    # -- zero-copy block slicing (#77) & selection (#78) ----------------------
+
+    def major_slice(self, start: int, end: int) -> Any:
+        """Zero-copy normalized view of contiguous major-axis slices ``[start, end)``.
+
+        Shares ``values``/``indices`` and per-minor statistics with ``self``;
+        slices only the per-major statistic(s).
+        """
+        sub = self._arr.major_slice(start, end)
+        n_major = self._arr.n_major
+        s = int(start) + n_major if int(start) < 0 else int(start)
+        e = int(end) + n_major if int(end) < 0 else int(end)
+        if self._format == "csr":
+            return type(self)._from_internal_stats(
+                sub,
+                self.recipe,
+                row_scale=self.row_scale[s:e],
+                gene_scale=self.gene_scale,
+                col_mean=self.col_mean,
+                col_post_scale=self.col_post_scale,
+                stale=self.stale,
+            )
+        return type(self)._from_internal_stats(
+            sub,
+            self.recipe,
+            row_scale=self.row_scale,
+            gene_scale=self.gene_scale[s:e],
+            col_mean=self.col_mean[s:e],
+            col_post_scale=self.col_post_scale[s:e],
+            stale=self.stale,
+        )
+
+    def nnz_blocks(self, max_nnz: int) -> list[tuple[int, int]]:
+        """Partition the major axis into ``(start, end)`` ranges of at most ``max_nnz`` nonzeros."""
+        return self._arr.nnz_blocks(max_nnz)
+
+    def iter_blocks(self, max_nnz: int, *, gpu: bool = False):
+        """Yield zero-copy block views (or GPU block views if ``gpu=True``) covering ``self``."""
+        for start, end in self.nnz_blocks(max_nnz):
+            block = self.major_slice(start, end)
+            yield block.to_gpu() if gpu else block
 
     def select(
         self, rows: Any = slice(None), cols: Any = slice(None), *, recalculate: bool = True
@@ -1100,13 +1140,13 @@ class NormalizedViewBase:
         if not isinstance(sub, type(self._arr)):
             sub = type(self._arr).from_scipy(sub)
         if not recalculate:
-            return type(self).from_stats(
+            return type(self)._from_internal_stats(
                 sub,
                 self.recipe,
-                np.asarray(self.a)[row_key],
-                np.asarray(self.b)[col_key],
-                np.asarray(self.c)[col_key],
-                np.asarray(self.s)[col_key],
+                row_scale=np.asarray(self.row_scale)[row_key],
+                gene_scale=np.asarray(self.gene_scale)[col_key],
+                col_mean=np.asarray(self.col_mean)[col_key],
+                col_post_scale=np.asarray(self.col_post_scale)[col_key],
                 stale=self.stale,
             )
         return type(self)(sub, self.recipe)
