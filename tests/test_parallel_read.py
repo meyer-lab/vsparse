@@ -183,3 +183,23 @@ def test_numcodecs_decodes_hdf5_zstd_chunks(tmp_path):
     with h5py.File(path, "r") as f:
         _mask, raw = f["a"].id.read_direct_chunk((0,))
     np.testing.assert_array_equal(np.frombuffer(numcodecs.Zstd().decode(raw), np.int64), data)
+
+
+def test_large_contiguous_reads_in_parallel(tmp_path, monkeypatch):
+    """Large (>= 1 MiB) contiguous uncompressed 1-D datasets use zero-copy parallel preadv."""
+    calls = []
+    real = _compression._read_contiguous_parallel
+
+    def wrapped(*args):
+        calls.append(args[0].name)
+        return real(*args)
+
+    monkeypatch.setattr(_compression, "_read_contiguous_parallel", wrapped)
+    data = np.random.default_rng(0).integers(0, 255, size=3 << 20, dtype=np.uint8)
+    path = tmp_path / "contig.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("a", data=data)
+    with h5py.File(path, "r") as f:
+        out = _compression.read_array(f["a"])
+    np.testing.assert_array_equal(out, data)
+    assert calls == ["/a"]
