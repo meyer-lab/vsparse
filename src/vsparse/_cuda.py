@@ -752,6 +752,42 @@ class CudaNormalizedView:
         self.col_mean = cp.asarray(view.col_mean, dtype=DEVICE_DTYPE)
         self.col_post_scale = cp.asarray(view.col_post_scale, dtype=DEVICE_DTYPE)
 
+    @classmethod
+    def _from_device(
+        cls,
+        *,
+        format: str,
+        shape: tuple[int, int],
+        recipe: Any,
+        major_ptr: Any,
+        values: Any,
+        value_ptr: Any,
+        indices: Any,
+        row_scale: Any,
+        gene_scale: Any,
+        col_mean: Any,
+        col_post_scale: Any,
+        sm_count: int | None = None,
+    ) -> CudaNormalizedView:
+        """Build a view directly from device-resident CuPy arrays (no host transfer)."""
+        self = object.__new__(cls)
+        self._format = format
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.recipe = recipe
+        self.sm_count = (
+            _sm_count(_require_cupy().cuda.Device().id) if sm_count is None else int(sm_count)
+        )
+        self._plans = {}
+        self.major_ptr = major_ptr
+        self.values = values
+        self.value_ptr = value_ptr
+        self.indices = indices
+        self.row_scale = row_scale
+        self.gene_scale = gene_scale
+        self.col_mean = col_mean
+        self.col_post_scale = col_post_scale
+        return self
+
     # -- introspection --------------------------------------------------------
 
     @property
