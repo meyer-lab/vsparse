@@ -138,14 +138,14 @@ def _vcsr_anndata(n_obs=400, n_vars=60) -> VCSCAnnData:
 
 
 def test_write_h5ad_reads_in_parallel(tmp_path, spy):
-    """Every IVCSR array written by write_h5ad takes the parallel read path."""
+    """Zstd-compressed IVCSR arrays written by write_h5ad take the parallel read path."""
     va = _vcsr_anndata()
     path = tmp_path / "x.h5ad"
     va.write_h5ad(path)
     back = VCSCAnnData.read_h5ad(path)
     assert back.X is not None and va.X is not None
     np.testing.assert_array_equal(back.X.toarray(), va.X.toarray())
-    assert {"/X/major_ptr", "/X/values", "/X/value_ptr", "/X/packed_indices"} <= set(spy)
+    assert {"/X/major_ptr", "/X/values", "/X/value_ptr", "/X/bit_offsets"} <= set(spy)
 
 
 def test_blosc2_file_still_reads(tmp_path, spy):
@@ -154,7 +154,7 @@ def test_blosc2_file_still_reads(tmp_path, spy):
     path = tmp_path / "legacy.h5ad"
     va.write_h5ad(path, dataset_kwargs=dict(hdf5plugin.Blosc2(cname="lz4")))
     with h5py.File(path, "r") as f:
-        assert "32026" in f["X"]["packed_indices"]._filters
+        assert "32026" in f["X"]["values"]._filters
     back = VCSCAnnData.read_h5ad(path)
     assert back.X is not None and va.X is not None
     np.testing.assert_array_equal(back.X.toarray(), va.X.toarray())
