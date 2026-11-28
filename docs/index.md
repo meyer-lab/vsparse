@@ -17,5 +17,6 @@ matrices, e.g. single-cell RNA-seq counts.
 :maxdepth: 2
 
 usage
+gpu_streaming
 api
 ```

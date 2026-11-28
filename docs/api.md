@@ -26,6 +26,13 @@
    :undoc-members:
    :show-inheritance:
 
+.. autoclass:: vsparse.CudaStreamedView
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. autofunction:: vsparse.open_gpu_stream
+
 .. autofunction:: vsparse.cuda_is_available
 
 .. autoclass:: vsparse.VCSCAnnData
