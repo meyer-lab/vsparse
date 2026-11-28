@@ -290,19 +290,77 @@ def _read_chunks_parallel(
     return out
 
 
+def pread_into(fd: int, mv: memoryview, file_offset: int) -> None:
+    """Zero-copy read from ``fd`` at ``file_offset`` filling ``mv`` completely."""
+    n = len(mv)
+    done = 0
+    if hasattr(os, "preadv"):
+        while done < n:
+            got = os.preadv(fd, [mv[done:]], file_offset + done)
+            if got == 0:
+                raise OSError("unexpected EOF during preadv")
+            done += got
+    else:
+        mv[:] = os.pread(fd, n, file_offset)
+
+
+def _contiguous_h5_offset(ds: Any) -> int | None:
+    """File byte offset of a large contiguous, uncompressed, 1-D read-only POSIX HDF5 dataset."""
+    import h5py
+
+    if not isinstance(ds, h5py.Dataset) or ds.ndim != 1 or ds.chunks is not None:
+        return None
+    if not hasattr(os, "pread") or ds.file.mode != "r" or ds.file.driver != "sec2":
+        return None
+    if ds.id.get_create_plist().get_nfilters() != 0:
+        return None
+    if ds.shape[0] * ds.dtype.itemsize < _H5_CHUNK_BYTES:
+        return None
+    offset = ds.id.get_offset()
+    return None if offset is None else int(offset)
+
+
+def _read_contiguous_parallel(ds: Any, file_offset: int) -> np.ndarray:
+    out = np.empty(ds.shape, dtype=ds.dtype)
+    mv = memoryview(out.view(np.uint8))
+    total = len(mv)
+    n_workers = max(1, min(numba.get_num_threads(), total // _H5_CHUNK_BYTES))
+    bounds = np.linspace(0, total, n_workers + 1).astype(np.int64)
+    fd = os.open(ds.file.filename, os.O_RDONLY)
+
+    def load_slice(t: int) -> None:
+        s, e = int(bounds[t]), int(bounds[t + 1])
+        if e > s:
+            pread_into(fd, mv[s:e], file_offset + s)
+
+    try:
+        if n_workers == 1:
+            load_slice(0)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                list(pool.map(load_slice, range(n_workers)))
+    finally:
+        os.close(fd)
+    return out
+
+
 def read_array(ds: Any) -> np.ndarray:
-    """Read a whole dataset into memory, decoding zstd chunks in parallel where possible.
+    """Read a whole dataset into memory, using parallel ``os.pread``/``preadv`` where possible.
 
     ``ds`` is an h5py dataset or zarr array. A zstd-compressed, chunked, 1-D
     h5py dataset (what :func:`h5_dataset_kwargs` writes for every VCS array)
     is decoded chunk-by-chunk on a thread pool sized by
-    ``numba.get_num_threads()``; everything else, including Blosc2-compressed
-    files written by earlier versions, is read the ordinary way. See the
-    module docstring.
+    ``numba.get_num_threads()``; a large (>= 1 MiB) contiguous uncompressed
+    1-D h5py dataset (such as IVCS v2 ``packed_indices``) is read directly into
+    the destination array in parallel with zero-copy ``os.preadv``; everything
+    else falls back to the ordinary read path.
     """
     table = _chunk_table(ds) if _is_parallel_zstd(ds) else None
-    if table is None:
-        import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
+    if table is not None:
+        return _read_chunks_parallel(ds, *table)
+    contig_offset = _contiguous_h5_offset(ds)
+    if contig_offset is not None:
+        return _read_contiguous_parallel(ds, contig_offset)
+    import hdf5plugin  # noqa: F401  -- registers the zstd/Blosc2 HDF5 filters
 
-        return np.asarray(ds[...])
-    return _read_chunks_parallel(ds, *table)
+    return np.asarray(ds[...])

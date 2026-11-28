@@ -44,8 +44,8 @@ with vsparse.open_gpu_stream(
     B = np.random.default_rng(0).normal(size=(gv.shape[1], 16)).astype(np.float32)
     C = np.random.default_rng(1).normal(size=(16, gv.shape[0])).astype(np.float32)
 
-    out_right = gv @ B          # (n_rows, 16) float32 CuPy array
-    out_left = C @ gv           # (16, n_cols) float32 CuPy array
+    out_right = gv @ B  # (n_rows, 16) float32 CuPy array
+    out_left = C @ gv  # (16, n_cols) float32 CuPy array
 
     # Preferred in iterative fits (e.g. PARAFAC2 / SVD): computes both in one pass
     ab, ca = gv.matmul_both(B, C)

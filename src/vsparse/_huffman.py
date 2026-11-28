@@ -26,6 +26,7 @@ from typing import Any
 import numba
 import numpy as np
 
+from vsparse._compression import pread_into
 from vsparse._indexutils import smallest_index_dtype
 
 __all__ = [
@@ -525,6 +526,29 @@ def _h5_contiguous_offset(ds: Any) -> int | None:
     return None if offset is None else int(offset)
 
 
+_PREAD_CHUNK_BYTES = 1 << 20  # split large coalesced spans into 1 MiB parallel reads
+
+
+def _split_large_spans(
+    span_starts: np.ndarray, span_ends: np.ndarray
+) -> tuple[list[int], list[int], list[int]]:
+    """Split spans larger than ``_PREAD_CHUNK_BYTES`` into parallelizable sub-reads."""
+    src_starts: list[int] = []
+    dst_starts: list[int] = []
+    lengths: list[int] = []
+    dst = 0
+    for s, e in zip(span_starts.tolist(), span_ends.tolist(), strict=True):
+        pos = s
+        while pos < e:
+            n = min(_PREAD_CHUNK_BYTES, e - pos)
+            src_starts.append(pos)
+            dst_starts.append(dst)
+            lengths.append(n)
+            pos += n
+            dst += n
+    return src_starts, dst_starts, lengths
+
+
 def _pread_spans(
     filename: str,
     file_offset: int,
@@ -532,22 +556,18 @@ def _pread_spans(
     span_ends: np.ndarray,
     out: np.ndarray,
 ) -> None:
-    n_spans = span_starts.shape[0]
-    lengths = span_ends - span_starts
-    dest_offsets = np.zeros(n_spans, dtype=np.int64)
-    if n_spans > 1:
-        np.cumsum(lengths[:-1], out=dest_offsets[1:])
-
+    src_starts, dst_starts, lengths = _split_large_spans(span_starts, span_ends)
+    n_ops = len(lengths)
+    mv = memoryview(out)
     fd = os.open(filename, os.O_RDONLY)
-    n_workers = max(1, min(numba.get_num_threads(), n_spans))
-    bounds = np.linspace(0, n_spans, n_workers + 1).astype(np.int64)
+    n_workers = max(1, min(numba.get_num_threads(), n_ops))
+    bounds = np.linspace(0, n_ops, n_workers + 1).astype(np.int64)
 
     def read_run(t: int) -> None:
         for m in range(bounds[t], bounds[t + 1]):
-            nbytes = int(lengths[m])
-            raw = os.pread(fd, nbytes, file_offset + int(span_starts[m]))
-            dst = int(dest_offsets[m])
-            out[dst : dst + nbytes] = np.frombuffer(raw, dtype=np.uint8, count=nbytes)
+            dst = dst_starts[m]
+            nbytes = lengths[m]
+            pread_into(fd, mv[dst : dst + nbytes], file_offset + src_starts[m])
 
     try:
         if n_workers == 1:
@@ -574,7 +594,8 @@ def read_selected_bytes(
         return np.zeros(PAD_BYTES, dtype=np.uint8), local_bit_offsets
 
     total_bytes = int(np.sum(span_ends - span_starts))
-    local_buf = np.zeros(total_bytes + PAD_BYTES, dtype=np.uint8)
+    local_buf = np.empty(total_bytes + PAD_BYTES, dtype=np.uint8)
+    local_buf[total_bytes:] = 0
 
     file_offset = _h5_contiguous_offset(ds)
     if file_offset is not None:
